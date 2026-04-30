@@ -231,6 +231,19 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class P2PConfig(Base):
+    """P2P collaboration network configuration."""
+
+    enabled: bool = False
+    agent_id: str = ""
+    description: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    max_concurrent_tasks: int = 3
+    poll_interval: float = 5.0
+    mailboxes_root: str = "~/.nanobot/mailboxes"
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -240,6 +253,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    mailbox: P2PConfig = Field(default_factory=P2PConfig)
 
     @property
     def workspace_path(self) -> Path:

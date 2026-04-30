@@ -30,6 +30,14 @@ from nanobot.agent.tools.ask import (
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.p2p import (
+    BroadcastTaskTool,
+    CheckAggregationTool,
+    DispatchTaskTool,
+    FinalizeTaskTool,
+    PollTaskResultTool,
+    ReportUserTool,
+)
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
@@ -208,6 +216,7 @@ class AgentLoop:
         tools_config: ToolsConfig | None = None,
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        p2p_shell: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -215,6 +224,7 @@ class AgentLoop:
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
+        self.p2p_shell = p2p_shell
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
         self._provider_signature = provider_signature
@@ -369,6 +379,20 @@ class AgentLoop:
             )
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
+        # Register P2P tools if enabled
+        if self.p2p_shell:
+            self.tools.register(DispatchTaskTool(shell=self.p2p_shell))
+            self.tools.register(PollTaskResultTool(shell=self.p2p_shell))
+            self.tools.register(BroadcastTaskTool(shell=self.p2p_shell))
+            self.tools.register(CheckAggregationTool(shell=self.p2p_shell))
+            self.tools.register(
+                ReportUserTool(
+                    send_callback=self.bus.publish_outbound,
+                    default_channel=getattr(self.channels_config, "default_channel", ""),
+                    default_chat_id=getattr(self.channels_config, "default_chat_id", ""),
+                )
+            )
+            self.tools.register(FinalizeTaskTool(shell=self.p2p_shell, session_manager=self.sessions))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -899,6 +923,7 @@ class AgentLoop:
                 chat_id=chat_id,
                 session_summary=pending,
                 current_role=current_role,
+                session_key=key,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -979,7 +1004,7 @@ class AgentLoop:
         pending_ask_id = pending_ask_user_id(history)
         if pending_ask_id:
             initial_messages = ask_user_tool_result_messages(
-                self.context.build_system_prompt(channel=msg.channel),
+                self.context.build_system_prompt(channel=msg.channel, session_key=key),
                 history,
                 pending_ask_id,
                 msg.content,
@@ -992,6 +1017,7 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=self._runtime_chat_id(msg),
+                session_key=key,
             )
 
         async def _bus_progress(

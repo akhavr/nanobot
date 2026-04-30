@@ -49,6 +49,7 @@ class SafeFileHistory(FileHistory):
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
+from nanobot.p2p.shell import P2PShell
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.restart import (
     consume_restart_notice_from_env,
@@ -65,6 +66,17 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+
+def _resolve_p2p(config: Config) -> P2PShell | None:
+    """Resolve P2P config and create the stateless P2P shell."""
+    mb_cfg = config.mailbox
+    if not mb_cfg.enabled:
+        return None
+    return P2PShell(
+        agent_id=mb_cfg.agent_id,
+        mailboxes_root=mb_cfg.mailboxes_root,
+    )
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -517,6 +529,9 @@ def serve(
     bus = MessageBus()
     provider = _make_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
+
+    p2p_shell = _resolve_p2p(runtime_config)
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -539,6 +554,7 @@ def serve(
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
         tools_config=runtime_config.tools,
+        p2p_shell=p2p_shell,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -628,6 +644,8 @@ def _run_gateway(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    p2p_shell = _resolve_p2p(config)
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -654,6 +672,7 @@ def _run_gateway(
         tools_config=config.tools,
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
+        p2p_shell=p2p_shell,
     )
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
@@ -851,6 +870,8 @@ def _run_gateway(
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
+        p2p_shell=p2p_shell,
+        bus=bus,
     )
 
     if channels.enabled_channels:
@@ -1017,6 +1038,8 @@ def agent(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    p2p_shell = _resolve_p2p(config)
+
     if logs:
         logger.enable("nanobot")
     else:
@@ -1044,6 +1067,7 @@ def agent(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         tools_config=config.tools,
+        p2p_shell=p2p_shell,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
@@ -1215,6 +1239,7 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
+                pass
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
