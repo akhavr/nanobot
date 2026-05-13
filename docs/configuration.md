@@ -672,7 +672,8 @@ Existing configs do not need to change. If you do not set `modelPresets` or `age
       "maxTokens": 8192,
       "contextWindowTokens": 128000,
       "temperature": 0.1,
-      "modelPreset": null
+      "modelPreset": "fast",
+      "fallbackModels": ["deep"]
     }
   },
   "modelPresets": {
@@ -707,6 +708,40 @@ Existing configs do not need to change. If you do not set `modelPresets` or `age
 | `reasoningEffort` | Optional reasoning/thinking setting. Provider support varies. |
 
 `default` is reserved and always means the implicit preset built from `agents.defaults.*`; do not define `modelPresets.default`. Use `/model default` to switch back to `agents.defaults.*`.
+
+### Model Fallbacks
+
+`agents.defaults.fallbackModels` defines an ordered failover chain for the active model configuration. The primary model is still selected by `agents.defaults.modelPreset` (or the implicit default config when no preset is active).
+
+Each fallback candidate can be either:
+
+- A preset name from `modelPresets`, such as `"deep"`. The preset's full model, provider, generation, and context-window config is used.
+- An inline fallback object with at least `provider` and `model`. Optional `maxTokens`, `contextWindowTokens`, and `temperature` fields inherit from the active primary config when omitted. `reasoningEffort` does not inherit; omit it to leave reasoning off for that fallback, or set it explicitly for models that support reasoning.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "modelPreset": "fast",
+      "fallbackModels": [
+        "deep",
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-pro",
+          "maxTokens": 4096,
+          "contextWindowTokens": 262144
+        }
+      ]
+    }
+  }
+}
+```
+
+String entries are preset names, not raw model names. If you want to use a model that is not already a preset, use the inline object form.
+
+Failover only runs when the primary provider returns a retryable model/provider error before any answer text has been streamed. Typical fallback cases include timeouts, connection errors, 5xx server errors, 429 rate limits, overloads, and quota/balance exhaustion. It does not run for malformed requests, authentication/permission errors, content filtering/refusals, or context-length/message-format errors.
+
+If fallback candidates use smaller `contextWindowTokens` values, nanobot builds context using the smallest window in the active chain so every candidate can receive the same prompt.
 
 Set `agents.defaults.modelPreset` to start with a named preset:
 
@@ -743,6 +778,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
 |---------|---------|-------------|
 | `sendProgress` | `true` | Stream agent's text progress to the channel |
 | `sendToolHints` | `false` | Stream tool-call hints (e.g. `read_file("…")`) |
+| `showReasoning` | `true` | Allow channels to surface model reasoning/thinking content (DeepSeek-R1 `reasoning_content`, Anthropic `thinking_blocks`, inline `<think>` tags). Reasoning flows as a dedicated stream with `_reasoning_delta` / `_reasoning_end` markers — channels override `send_reasoning_delta` / `send_reasoning_end` to render in-place updates. Even with `true`, channels without those overrides stay no-op silently. Currently surfaced on CLI and WebSocket/WebUI (italic shimmer header, auto-collapses after the stream ends); Telegram / Slack / Discord / Feishu / WeChat / Matrix keep the base no-op until their bubble UI is adapted. Independent of `sendProgress`. |
 | `sendMaxRetries` | `3` | Max delivery attempts per outbound message, including the initial send (0-10 configured, minimum 1 actual attempt) |
 | `transcriptionProvider` | `"groq"` | Voice transcription backend: `"groq"` (free tier, default) or `"openai"`. API key is auto-resolved from the matching provider config. |
 | `transcriptionLanguage` | `null` | Optional ISO-639-1 language hint for audio transcription, e.g. `"en"`, `"ko"`, `"ja"`. |

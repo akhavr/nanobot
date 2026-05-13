@@ -35,6 +35,7 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    show_reasoning: bool = True  # surface model reasoning when channel implements it
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
@@ -73,6 +74,20 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class InlineFallbackConfig(Base):
+    """One inline fallback model configuration."""
+
+    model: str
+    provider: str
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    temperature: float | None = None
+    reasoning_effort: str | None = None
+
+
+FallbackCandidate = str | InlineFallbackConfig
+
+
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
 
@@ -105,6 +120,7 @@ class AgentDefaults(Base):
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
     temperature: float = 0.1
+    fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
     max_concurrent_subagents: int = Field(default=1, ge=1)
     max_tool_result_chars: int = 16_000
@@ -286,6 +302,9 @@ class Config(BaseSettings):
         name = self.agents.defaults.model_preset
         if name and name != "default" and name not in self.model_presets:
             raise ValueError(f"model_preset {name!r} not found in model_presets")
+        for fallback in self.agents.defaults.fallback_models:
+            if isinstance(fallback, str) and fallback not in self.model_presets:
+                raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
         return self
 
     def resolve_default_preset(self) -> ModelPresetConfig:
