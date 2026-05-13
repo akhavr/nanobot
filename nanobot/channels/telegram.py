@@ -188,6 +188,7 @@ class TelegramConfig(Base):
     reply_to_message: bool = False
     react_emoji: str = "👀"
     group_policy: Literal["open", "mention"] = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
@@ -798,7 +799,14 @@ class TelegramChannel(BaseChannel):
 
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot."""
-        if message.chat.type == "private" or self.config.group_policy == "open":
+        if message.chat.type == "private":
+            return True
+
+        group_allow = self.config.group_allow_from
+        if group_allow and str(message.chat_id) not in group_allow:
+            return False
+
+        if self.config.group_policy == "open":
             return True
 
         bot_id, bot_username = await self._ensure_bot_identity()
