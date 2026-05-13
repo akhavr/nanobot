@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 class HandoffState:
     """Structured progress state passed between long-task steps."""
 
+    signal_type: str = ""
     message: str = ""
     files_created: list[str] = field(default_factory=list)
     files_modified: list[str] = field(default_factory=list)
@@ -39,6 +40,7 @@ class HandoffState:
     def is_empty(self) -> bool:
         return not any(
             [
+                self.signal_type,
                 self.message,
                 self.files_created,
                 self.files_modified,
@@ -105,6 +107,7 @@ class HandoffTool(Tool):
         verification: str = "",
         **kwargs: Any,
     ) -> str:
+        self._store.signal_type = "handoff"
         self._store.message = message
         self._store.files_created = list(files_created or [])
         self._store.files_modified = list(files_modified or [])
@@ -139,6 +142,7 @@ class CompleteTool(Tool):
         )
 
     async def execute(self, summary: str, **kwargs: Any) -> str:
+        self._store.signal_type = "complete"
         self._store.message = summary
         return "Task marked as complete. Awaiting validation."
 
@@ -242,9 +246,19 @@ def _extract_handoff_from_messages(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-_FILE_EVENT_PREFIXES = ("Wrote ", "Edited ")
-# NOTE: path extraction depends on write_file/edit_file detail format.
-# If those tools change their output format, this mapping must be updated.
+def _extract_write_path(detail: str) -> str | None:
+    prefix = "Successfully wrote "
+    marker = " to "
+    if not detail.startswith(prefix) or marker not in detail:
+        return None
+    return detail.rsplit(marker, 1)[1].strip()
+
+
+def _extract_edit_path(detail: str) -> str | None:
+    for prefix in ("Successfully created ", "Successfully edited "):
+        if detail.startswith(prefix):
+            return detail.removeprefix(prefix).strip()
+    return None
 
 
 def _extract_file_changes(
@@ -259,13 +273,19 @@ def _extract_file_changes(
         detail = event.get("detail", "")
         if status != "ok":
             continue
-        if name in ("write_file", "edit_file"):
-            if detail.startswith(_FILE_EVENT_PREFIXES):
-                path = detail.split(" ", 1)[1].split(":")[0].strip()
-                if name == "write_file":
-                    created.append(path)
-                else:
-                    modified.append(path)
+        if name == "write_file":
+            path = _extract_write_path(detail)
+            if path:
+                created.append(path)
+            else:
+                logger.debug(
+                    "long_task: skipping file event with unexpected detail: {}",
+                    detail[:80],
+                )
+        elif name == "edit_file":
+            path = _extract_edit_path(detail)
+            if path:
+                modified.append(path)
             else:
                 logger.debug(
                     "long_task: skipping file event with unexpected detail: {}",
@@ -502,7 +522,7 @@ class LongTaskTool(Tool):
 
             # Determine signal from tool events
             sig_type = "none"
-            for event in tool_events:
+            for event in reversed(tool_events):
                 ev_name = event.get("name", "")
                 if ev_name == "complete":
                     sig_type = "complete"
@@ -512,11 +532,9 @@ class LongTaskTool(Tool):
                     break
 
             # Fallback: if no explicit signal but CompleteTool/HandoffTool was
-            # called without arguments (message empty), use final_content
-            if sig_type == "none" and signal_store.message:
-                # Tool was called but we couldn't detect from events;
-                # use the store content as handoff
-                sig_type = "handoff"
+            # called but the runner did not expose tool events, trust the store.
+            if sig_type == "none" and signal_store.signal_type:
+                sig_type = signal_store.signal_type
             elif sig_type == "none":
                 signal_store.message = _extract_handoff_from_messages(
                     getattr(result, "messages", []) or []

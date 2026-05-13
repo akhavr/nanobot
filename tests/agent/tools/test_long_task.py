@@ -1,21 +1,20 @@
 """Tests for Long Task Tool: HandoffTool, CompleteTool, LongTaskTool."""
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from nanobot.agent.tools.long_task import (
+    CompleteTool,
     HandoffState,
     HandoffTool,
-    CompleteTool,
     LongTaskTool,
-    LongTaskEvent,
     _build_system_prompt,
     _build_user_message,
     _extract_file_changes,
     _extract_handoff_from_messages,
 )
-
 
 # ---------------------------------------------------------------------------
 # Signal tool tests
@@ -34,6 +33,7 @@ async def test_handoff_tool_stores_structured_signal():
         verification="Tests passed",
     )
     assert result == "Progress recorded. The next step will continue from here."
+    assert store.signal_type == "handoff"
     assert store.message == "Processed items 1-8. Results in out.md."
     assert store.files_created == ["out.md", "report.md"]
     assert store.files_modified == ["main.py"]
@@ -58,6 +58,7 @@ async def test_complete_tool_stores_signal():
     tool = CompleteTool(store)
     result = await tool.execute(summary="All 100 items processed. Summary in report.md")
     assert result == "Task marked as complete. Awaiting validation."
+    assert store.signal_type == "complete"
     assert store.message == "All 100 items processed. Summary in report.md"
 
 
@@ -70,6 +71,7 @@ async def test_signal_tools_overwrite_on_multiple_calls():
     await handoff.execute(message="first progress")
     assert store.message == "first progress"
     await complete.execute(summary="done early")
+    assert store.signal_type == "complete"
     assert store.message == "done early"
 
 
@@ -189,6 +191,44 @@ async def test_long_task_completes_after_multiple_handoffs():
     result = await tool.execute(goal="Audit 16 issues.")
     assert result == "All 16 items audited."
     assert call_count == 4  # 3 main steps + validation
+
+
+@pytest.mark.asyncio
+async def test_long_task_uses_last_signal_when_multiple_signals_called():
+    """If a step calls handoff() then complete(), complete() should win."""
+    mgr = _make_manager_stub()
+    call_count = 0
+
+    async def fake_run_step(*, system_prompt, user_message, extra_tools, max_iterations=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for t in extra_tools:
+                if t.name == "handoff":
+                    await t.execute(message="Partial progress.")
+                elif t.name == "complete":
+                    await t.execute(summary="Actually complete.")
+            return _step_result(
+                tools_used=["handoff", "complete"],
+                tool_events=[
+                    {"name": "handoff", "status": "ok", "detail": ""},
+                    {"name": "complete", "status": "ok", "detail": ""},
+                ],
+            )
+
+        for t in extra_tools:
+            if t.name == "complete":
+                await t.execute(summary="Validated")
+        return _step_result(
+            tools_used=["complete"],
+            tool_events=[{"name": "complete", "status": "ok", "detail": ""}],
+        )
+
+    mgr.run_step.side_effect = fake_run_step
+    tool = LongTaskTool(manager=mgr)
+    result = await tool.execute(goal="Do something.", max_steps=1)
+    assert result == "Actually complete."
+    assert call_count == 2  # main step + validation
 
 
 @pytest.mark.asyncio
@@ -566,14 +606,27 @@ def test_extract_handoff_from_empty_messages():
 
 def test_extract_file_changes_from_tool_events():
     events = [
-        {"name": "write_file", "status": "ok", "detail": "Wrote /workspace/a.py: done"},
-        {"name": "edit_file", "status": "ok", "detail": "Edited /workspace/b.py: patched"},
+        {
+            "name": "write_file",
+            "status": "ok",
+            "detail": "Successfully wrote 12 characters to /workspace/a.py",
+        },
+        {
+            "name": "edit_file",
+            "status": "ok",
+            "detail": "Successfully edited /workspace/b.py",
+        },
+        {
+            "name": "edit_file",
+            "status": "ok",
+            "detail": "Successfully created /workspace/c.py",
+        },
         {"name": "read_file", "status": "ok", "detail": "Read /workspace/c.py"},
         {"name": "write_file", "status": "error", "detail": "Failed"},
     ]
     created, modified = _extract_file_changes(events)
     assert created == ["/workspace/a.py"]
-    assert modified == ["/workspace/b.py"]
+    assert modified == ["/workspace/b.py", "/workspace/c.py"]
 
 
 def test_extract_file_changes_empty():
@@ -736,7 +789,11 @@ async def test_explicit_file_changes_override_auto_detected():
             tool_events=[
                 {"name": "handoff", "status": "ok", "detail": ""},
                 # Auto-detection would pick this up as "auto.py"
-                {"name": "write_file", "status": "ok", "detail": "Wrote auto.py: content"},
+                {
+                    "name": "write_file",
+                    "status": "ok",
+                    "detail": "Successfully wrote 7 characters to auto.py",
+                },
             ],
         )
 
