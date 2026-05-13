@@ -79,6 +79,8 @@ class HandoffState:
 class HandoffTool(Tool):
     """Signal that the step is done but the overall task continues."""
 
+    _plugin_discoverable = False
+
     def __init__(self, store: HandoffState) -> None:
         self._store = store
 
@@ -119,6 +121,8 @@ class HandoffTool(Tool):
 )
 class CompleteTool(Tool):
     """Signal that the entire long task is finished."""
+
+    _plugin_discoverable = False
 
     def __init__(self, store: HandoffState) -> None:
         self._store = store
@@ -195,7 +199,7 @@ def _build_user_message(
             goal=goal,
             budget=budget,
         )
-    elif step >= max_steps - 3:
+    elif step >= max_steps - 2:
         prompt = render_template(
             "agent/long_task/step_final.md",
             step=step,
@@ -238,6 +242,11 @@ def _extract_handoff_from_messages(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+_FILE_EVENT_PREFIXES = ("Wrote ", "Edited ")
+# NOTE: path extraction depends on write_file/edit_file detail format.
+# If those tools change their output format, this mapping must be updated.
+
+
 def _extract_file_changes(
     tool_events: list[dict[str, Any]],
 ) -> tuple[list[str], list[str]]:
@@ -251,13 +260,17 @@ def _extract_file_changes(
         if status != "ok":
             continue
         if name in ("write_file", "edit_file"):
-            # Try to extract file path from detail
-            if detail.startswith("Wrote ") or detail.startswith("Edited "):
+            if detail.startswith(_FILE_EVENT_PREFIXES):
                 path = detail.split(" ", 1)[1].split(":")[0].strip()
                 if name == "write_file":
                     created.append(path)
                 else:
                     modified.append(path)
+            else:
+                logger.debug(
+                    "long_task: skipping file event with unexpected detail: {}",
+                    detail[:80],
+                )
     return created, modified
 
 
@@ -292,9 +305,13 @@ class LongTaskEvent:
 class LongTaskTool(Tool):
     """Execute a long-running task via a meta-ReAct loop of subagent steps."""
 
+    # NOT available in subagent scope to prevent recursive long_task nesting.
+    _scopes: set[str] = {"core"}
+
     def __init__(self, manager: SubagentManager) -> None:
         self._manager = manager
         self._hooks: dict[str, Any] = {}
+        self._state: dict[str, Any] = {"signal_queue": []}
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -303,9 +320,7 @@ class LongTaskTool(Tool):
         Preserves any pending user corrections so inject_correction() can be
         called before execute() starts.
         """
-        existing_signals = (
-            self._state.get("signal_queue", []) if hasattr(self, "_state") else []
-        )
+        existing_signals = self._state.get("signal_queue", [])
         self._state: dict[str, Any] = {
             "current_step": 0,
             "total_steps": 0,
