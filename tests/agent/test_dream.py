@@ -458,9 +458,9 @@ class TestDreamGroupSessionDetection:
         assert dream.is_group_session("telegram:123456789", {"member_count": 3}) is True
         assert dream.is_group_session("telegram:123456789", {"member_count": 10}) is True
 
-        # member_count <= 2 does not make a group key non-group
-        # (pattern still matches)
-        assert dream.is_group_session("telegram:-1001234567890", {"member_count": 2}) is True
+        # member_count <= 2 overrides pattern: negative ID with 2 members is a 1:1 chat
+        assert dream.is_group_session("telegram:-1001234567890", {"member_count": 2}) is False
+        assert dream.is_group_session("telegram:-1001234567890", {"member_count": 1}) is False
 
     def test_dm_with_low_member_count_not_group(self, store, mock_provider):
         """DM key with member_count <= 2 is not a group."""
