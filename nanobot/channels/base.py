@@ -24,6 +24,11 @@ class BaseChannel(ABC):
     display_name: str = "Base"
     transcription_provider: str = "groq"
     transcription_api_key: str = ""
+    transcription_api_base: str = ""
+    transcription_language: str | None = None
+    send_progress: bool = True
+    send_tool_hints: bool = False
+    show_reasoning: bool = True
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -34,6 +39,7 @@ class BaseChannel(ABC):
             bus: The message bus for communication.
         """
         self.config = config
+        self.logger = logger.bind(channel=self.name)
         self.bus = bus
         self._running = False
 
@@ -44,13 +50,21 @@ class BaseChannel(ABC):
         try:
             if self.transcription_provider == "openai":
                 from nanobot.providers.transcription import OpenAITranscriptionProvider
-                provider = OpenAITranscriptionProvider(api_key=self.transcription_api_key)
+                provider = OpenAITranscriptionProvider(
+                    api_key=self.transcription_api_key,
+                    api_base=self.transcription_api_base or None,
+                    language=self.transcription_language or None,
+                )
             else:
                 from nanobot.providers.transcription import GroqTranscriptionProvider
-                provider = GroqTranscriptionProvider(api_key=self.transcription_api_key)
+                provider = GroqTranscriptionProvider(
+                    api_key=self.transcription_api_key,
+                    api_base=self.transcription_api_base or None,
+                    language=self.transcription_language or None,
+                )
             return await provider.transcribe(file_path)
-        except Exception as e:
-            logger.warning("{}: audio transcription failed: {}", self.name, e)
+        except Exception:
+            self.logger.exception("Audio transcription failed")
             return ""
 
     async def login(self, force: bool = False) -> bool:
@@ -107,6 +121,53 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def send_reasoning_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Stream a chunk of model reasoning/thinking content.
+
+        Default is no-op. Channels with a native low-emphasis primitive
+        (Slack context block, Telegram expandable blockquote, Discord
+        subtext, WebUI italic bubble, ...) override to render reasoning
+        as a subordinate trace that updates in place as the model thinks.
+
+        Streaming contract mirrors :meth:`send_delta`: ``_reasoning_delta``
+        is a chunk, ``_reasoning_end`` ends the current reasoning segment,
+        and stateful implementations should key buffers by ``_stream_id``
+        rather than only by ``chat_id``.
+        """
+        return
+
+    async def send_reasoning_end(
+        self, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Mark the end of a reasoning stream segment.
+
+        Default is no-op. Channels that buffer ``send_reasoning_delta``
+        chunks for in-place updates use this signal to flush and freeze
+        the rendered group; one-shot channels can ignore it entirely.
+        """
+        return
+
+    async def send_reasoning(self, msg: OutboundMessage) -> None:
+        """Deliver a complete reasoning block.
+
+        Default implementation reuses the streaming pair so plugins only
+        need to override the delta/end methods. Equivalent to one delta
+        with the full content followed immediately by an end marker —
+        keeps a single rendering path for both streamed and one-shot
+        reasoning (e.g. DeepSeek-R1's final-response ``reasoning_content``).
+        """
+        if not msg.content:
+            return
+        meta = dict(msg.metadata or {})
+        meta.setdefault("_reasoning_delta", True)
+        await self.send_reasoning_delta(msg.chat_id, msg.content, meta)
+        end_meta = dict(meta)
+        end_meta.pop("_reasoning_delta", None)
+        end_meta["_reasoning_end"] = True
+        await self.send_reasoning_end(msg.chat_id, end_meta)
+
     @property
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""
@@ -116,9 +177,15 @@ class BaseChannel(ABC):
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
-        allow_list = getattr(self.config, "allow_from", [])
+        if isinstance(self.config, dict):
+            if "allow_from" in self.config:
+                allow_list = self.config.get("allow_from")
+            else:
+                allow_list = self.config.get("allowFrom", [])
+        else:
+            allow_list = getattr(self.config, "allow_from", [])
         if not allow_list:
-            logger.warning("{}: allow_from is empty — all access denied", self.name)
+            self.logger.warning("allow_from is empty — all access denied")
             return False
         if "*" in allow_list:
             return True
@@ -147,10 +214,10 @@ class BaseChannel(ABC):
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
         if not self.is_allowed(sender_id):
-            logger.warning(
-                "Access denied for sender {} on channel {}. "
+            self.logger.warning(
+                "Access denied for sender {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
             )
             return
 

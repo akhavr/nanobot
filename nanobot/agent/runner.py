@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,17 +13,20 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.helpers import (
+    IncrementalThinkExtractor,
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
+    extract_reasoning,
     find_legal_message_start,
     maybe_persist_tool_result,
+    strip_think,
     truncate_text,
 )
+from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     build_finalization_retry_message,
@@ -28,12 +34,15 @@ from nanobot.utils.runtime import (
     ensure_nonempty_tool_result,
     is_blank_text,
     repeated_external_lookup_error,
+    repeated_workspace_violation_error,
 )
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+_MAX_INJECTIONS_PER_TURN = 3
+_MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
@@ -42,6 +51,9 @@ _COMPACTABLE_TOOLS = frozenset({
     "web_search", "web_fetch", "list_dir",
 })
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
+
+
+
 @dataclass(slots=True)
 class AgentRunSpec:
     """Configuration for a single agent execution."""
@@ -65,7 +77,11 @@ class AgentRunSpec:
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
     progress_callback: Any | None = None
+    stream_progress_deltas: bool = True
+    retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
+    injection_callback: Any | None = None
+    llm_timeout_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -79,6 +95,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    had_injections: bool = False
 
 
 class AgentRunner:
@@ -86,6 +103,134 @@ class AgentRunner:
 
     def __init__(self, provider: LLMProvider):
         self.provider = provider
+
+    @staticmethod
+    def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
+        if isinstance(left, str) and isinstance(right, str):
+            return f"{left}\n\n{right}" if left else right
+
+        def _to_blocks(value: Any) -> list[dict[str, Any]]:
+            if isinstance(value, list):
+                return [
+                    item if isinstance(item, dict) else {"type": "text", "text": str(item)}
+                    for item in value
+                ]
+            if value is None:
+                return []
+            return [{"type": "text", "text": str(value)}]
+
+        return _to_blocks(left) + _to_blocks(right)
+
+    @classmethod
+    def _append_injected_messages(
+        cls,
+        messages: list[dict[str, Any]],
+        injections: list[dict[str, Any]],
+    ) -> None:
+        """Append injected user messages while preserving role alternation."""
+        for injection in injections:
+            if (
+                messages
+                and injection.get("role") == "user"
+                and messages[-1].get("role") == "user"
+            ):
+                merged = dict(messages[-1])
+                merged["content"] = cls._merge_message_content(
+                    merged.get("content"),
+                    injection.get("content"),
+                )
+                messages[-1] = merged
+                continue
+            messages.append(injection)
+
+    async def _try_drain_injections(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        assistant_message: dict[str, Any] | None,
+        injection_cycles: int,
+        *,
+        phase: str = "after error",
+        iteration: int | None = None,
+    ) -> tuple[bool, int]:
+        """Drain pending injections. Returns (should_continue, updated_cycles).
+
+        If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
+        append them to *messages* (and emit a checkpoint if *assistant_message*
+        and *iteration* are both provided) and return (True, cycles+1) so the
+        caller continues the iteration loop.  Otherwise return (False, cycles).
+        """
+        if injection_cycles >= _MAX_INJECTION_CYCLES:
+            return False, injection_cycles
+        injections = await self._drain_injections(spec)
+        if not injections:
+            return False, injection_cycles
+        injection_cycles += 1
+        if assistant_message is not None:
+            messages.append(assistant_message)
+            if iteration is not None:
+                await self._emit_checkpoint(
+                    spec,
+                    {
+                        "phase": "final_response",
+                        "iteration": iteration,
+                        "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [],
+                        "pending_tool_calls": [],
+                    },
+                )
+        self._append_injected_messages(messages, injections)
+        logger.info(
+            "Injected {} follow-up message(s) {} ({}/{})",
+            len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
+        )
+        return True, injection_cycles
+
+    async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
+        """Drain pending user messages via the injection callback.
+
+        Returns normalized user messages (capped by
+        ``_MAX_INJECTIONS_PER_TURN``), or an empty list when there is
+        nothing to inject. Messages beyond the cap are logged so they
+        are not silently lost.
+        """
+        if spec.injection_callback is None:
+            return []
+        try:
+            signature = inspect.signature(spec.injection_callback)
+            accepts_limit = (
+                "limit" in signature.parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            )
+            if accepts_limit:
+                items = await spec.injection_callback(limit=_MAX_INJECTIONS_PER_TURN)
+            else:
+                items = await spec.injection_callback()
+        except Exception:
+            logger.exception("injection_callback failed")
+            return []
+        if not items:
+            return []
+        injected_messages: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, dict) and item.get("role") == "user" and "content" in item:
+                injected_messages.append(item)
+                continue
+            text = getattr(item, "content", str(item))
+            if text.strip():
+                injected_messages.append({"role": "user", "content": text})
+        if len(injected_messages) > _MAX_INJECTIONS_PER_TURN:
+            dropped = len(injected_messages) - _MAX_INJECTIONS_PER_TURN
+            logger.warning(
+                "Injection callback returned {} messages, capping to {} ({} dropped)",
+                len(injected_messages), _MAX_INJECTIONS_PER_TURN, dropped,
+            )
+            injected_messages = injected_messages[:_MAX_INJECTIONS_PER_TURN]
+        return injected_messages
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
@@ -97,8 +242,12 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        # Per-turn throttle for repeated attempts against the same outside target.
+        workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
+        had_injections = False
+        injection_cycles = 0
 
         for iteration in range(spec.max_iterations):
             try:
@@ -111,14 +260,20 @@ class AgentRunner:
                 messages_for_model = self._microcompact(messages_for_model)
                 messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
                 messages_for_model = self._snip_history(spec, messages_for_model)
-            except Exception as exc:
-                logger.warning(
-                    "Context governance failed on turn {} for {}: {}; using raw messages",
+                # Snipping may have created new orphans; clean them up.
+                messages_for_model = self._drop_orphan_tool_results(messages_for_model)
+                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+            except Exception:
+                logger.exception(
+                    "Context governance failed on turn {} for {}; applying minimal repair",
                     iteration,
                     spec.session_key or "default",
-                    exc,
                 )
-                messages_for_model = messages
+                try:
+                    messages_for_model = self._drop_orphan_tool_results(messages)
+                    messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+                except Exception:
+                    messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
@@ -128,7 +283,19 @@ class AgentRunner:
             context.tool_calls = list(response.tool_calls)
             self._accumulate_usage(usage, raw_usage)
 
-            if response.has_tool_calls:
+            reasoning_text, cleaned_content = extract_reasoning(
+                response.reasoning_content,
+                response.thinking_blocks,
+                response.content,
+            )
+            response.content = cleaned_content
+            if reasoning_text and not context.streamed_reasoning:
+                await hook.emit_reasoning(reasoning_text)
+                await hook.emit_reasoning_end()
+                context.streamed_reasoning = True
+
+            if response.should_execute_tools:
+                context.tool_calls = list(response.tool_calls)
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
@@ -158,20 +325,11 @@ class AgentRunner:
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
+                    workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
-                if fatal_error is not None:
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    final_content = error
-                    stop_reason = "tool_error"
-                    self._append_final_message(messages, final_content)
-                    context.final_content = final_content
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    await hook.after_iteration(context)
-                    break
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
@@ -187,6 +345,23 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+                if fatal_error is not None:
+                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
+                    final_content = error
+                    stop_reason = "tool_error"
+                    self._append_final_message(messages, final_content)
+                    context.final_content = final_content
+                    context.error = error
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    should_continue, injection_cycles = await self._try_drain_injections(
+                        spec, messages, None, injection_cycles,
+                        phase="after tool error",
+                    )
+                    if should_continue:
+                        had_injections = True
+                        continue
+                    break
                 await self._emit_checkpoint(
                     spec,
                     {
@@ -200,8 +375,22 @@ class AgentRunner:
                 )
                 empty_content_retries = 0
                 length_recovery_count = 0
+                # Checkpoint 1: drain injections after tools, before next LLM call
+                _drained, injection_cycles = await self._try_drain_injections(
+                    spec, messages, None, injection_cycles,
+                    phase="after tool execution",
+                )
+                if _drained:
+                    had_injections = True
                 await hook.after_iteration(context)
                 continue
+
+            if response.has_tool_calls:
+                logger.warning(
+                    "Ignoring tool calls under finish_reason='{}' for {}",
+                    response.finish_reason,
+                    spec.session_key or "default",
+                )
 
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
@@ -256,8 +445,31 @@ class AgentRunner:
                     await hook.after_iteration(context)
                     continue
 
+            assistant_message: dict[str, Any] | None = None
+            if response.finish_reason != "error" and not is_blank_text(clean):
+                assistant_message = build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                )
+
+            # Check for mid-turn injections BEFORE signaling stream end.
+            # If injections are found we keep the stream alive (resuming=True)
+            # so streaming channels don't prematurely finalize the card.
+            should_continue, injection_cycles = await self._try_drain_injections(
+                spec, messages, assistant_message, injection_cycles,
+                phase="after final response",
+                iteration=iteration,
+            )
+            if should_continue:
+                had_injections = True
+
             if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=False)
+                await hook.on_stream_end(context, resuming=should_continue)
+
+            if should_continue:
+                await hook.after_iteration(context)
+                continue
 
             if response.finish_reason == "error":
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
@@ -268,6 +480,13 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
+                should_continue, injection_cycles = await self._try_drain_injections(
+                    spec, messages, None, injection_cycles,
+                    phase="after LLM error",
+                )
+                if should_continue:
+                    had_injections = True
+                    continue
                 break
             if is_blank_text(clean):
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -278,9 +497,16 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
+                should_continue, injection_cycles = await self._try_drain_injections(
+                    spec, messages, None, injection_cycles,
+                    phase="after empty response",
+                )
+                if should_continue:
+                    had_injections = True
+                    continue
                 break
 
-            messages.append(build_assistant_message(
+            messages.append(assistant_message or build_assistant_message(
                 clean,
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
@@ -314,6 +540,17 @@ class AgentRunner:
                     max_iterations=spec.max_iterations,
                 )
             self._append_final_message(messages, final_content)
+            # Drain any remaining injections so they are appended to the
+            # conversation history instead of being re-published as
+            # independent inbound messages by _dispatch's finally block.
+            # We ignore should_continue here because the for-loop has already
+            # exhausted all iterations.
+            drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
+                spec, messages, None, injection_cycles,
+                phase="after max_iterations",
+            )
+            if drained_after_max_iterations:
+                had_injections = True
 
         return AgentRunResult(
             final_content=final_content,
@@ -323,6 +560,7 @@ class AgentRunner:
             stop_reason=stop_reason,
             error=error,
             tool_events=tool_events,
+            had_injections=had_injections,
         )
 
     def _build_request_kwargs(
@@ -337,7 +575,7 @@ class AgentRunner:
             "tools": tools,
             "model": spec.model,
             "retry_mode": spec.provider_retry_mode,
-            "on_retry_wait": spec.progress_callback,
+            "on_retry_wait": spec.retry_wait_callback,
         }
         if spec.temperature is not None:
             kwargs["temperature"] = spec.temperature
@@ -354,20 +592,90 @@ class AgentRunner:
         hook: AgentHook,
         context: AgentHookContext,
     ):
+        timeout_s: float | None = spec.llm_timeout_s
+        if timeout_s is None:
+            # Default to a finite timeout to avoid per-session lock starvation when an LLM
+            # request hangs indefinitely (e.g. gateway/network stall).
+            # Set NANOBOT_LLM_TIMEOUT_S=0 to disable.
+            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
+            try:
+                timeout_s = float(raw)
+            except (TypeError, ValueError):
+                timeout_s = 300.0
+        if timeout_s is not None and timeout_s <= 0:
+            timeout_s = None
+
         kwargs = self._build_request_kwargs(
             spec,
             messages,
             tools=spec.tools.get_definitions(),
         )
-        if hook.wants_streaming():
+        wants_streaming = hook.wants_streaming()
+        wants_progress_streaming = (
+            not wants_streaming
+            and spec.stream_progress_deltas
+            and spec.progress_callback is not None
+            and getattr(self.provider, "supports_progress_deltas", False) is True
+        )
+
+        progress_state: dict[str, bool] | None = None
+
+        if wants_streaming:
             async def _stream(delta: str) -> None:
+                if delta:
+                    context.streamed_content = True
                 await hook.on_stream(context, delta)
 
-            return await self.provider.chat_stream_with_retry(
+            coro = self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
             )
-        return await self.provider.chat_with_retry(**kwargs)
+        elif wants_progress_streaming:
+            stream_buf = ""
+            think_extractor = IncrementalThinkExtractor()
+            progress_state = {"reasoning_open": False}
+
+            async def _stream_progress(delta: str) -> None:
+                nonlocal stream_buf
+                if not delta:
+                    return
+                prev_clean = strip_think(stream_buf)
+                stream_buf += delta
+                new_clean = strip_think(stream_buf)
+                incremental = new_clean[len(prev_clean):]
+
+                if await think_extractor.feed(stream_buf, hook.emit_reasoning):
+                    context.streamed_reasoning = True
+                    progress_state["reasoning_open"] = True
+
+                if incremental:
+                    if progress_state["reasoning_open"]:
+                        await hook.emit_reasoning_end()
+                        progress_state["reasoning_open"] = False
+                    context.streamed_content = True
+                    await spec.progress_callback(incremental)
+
+            coro = self.provider.chat_stream_with_retry(
+                **kwargs,
+                on_content_delta=_stream_progress,
+            )
+        else:
+            coro = self.provider.chat_with_retry(**kwargs)
+
+        try:
+            response = (
+                await coro if timeout_s is None
+                else await asyncio.wait_for(coro, timeout=timeout_s)
+            )
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=f"Error calling LLM: timed out after {timeout_s:g}s",
+                finish_reason="error",
+                error_kind="timeout",
+            )
+        if progress_state and progress_state.get("reasoning_open"):
+            await hook.emit_reasoning_end()
+        return response
 
     async def _request_finalization_retry(
         self,
@@ -408,18 +716,27 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
-                tool_results.extend(await asyncio.gather(*(
-                    self._run_tool(spec, tool_call, external_lookup_counts)
+                batch_results = await asyncio.gather(*(
+                    self._run_tool(
+                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    )
                     for tool_call in batch
-                )))
+                ))
+                tool_results.extend(batch_results)
             else:
+                batch_results = []
                 for tool_call in batch:
-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
+                    result = await self._run_tool(
+                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                    )
+                    tool_results.append(result)
+                    batch_results.append(result)
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -436,8 +753,9 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
-        _HINT = "\n\n[Analyze the error above and try a different approach.]"
+        hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -450,24 +768,33 @@ class AgentRunner:
                 "detail": "repeated external lookup blocked",
             }
             if spec.fail_on_tool_error:
-                return lookup_error + _HINT, event, RuntimeError(lookup_error)
-            return lookup_error + _HINT, event, None
+                return lookup_error + hint, event, RuntimeError(lookup_error)
+            return lookup_error + hint, event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
         if callable(prepare_call):
-            try:
+            with suppress(Exception):
                 prepared = prepare_call(tool_call.name, tool_call.arguments)
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
-            except Exception:
-                pass
         if prep_error:
             event = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": prep_error.split(": ", 1)[-1][:120],
             }
-            return prep_error + _HINT, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
+            handled = self._classify_violation(
+                raw_text=prep_error,
+                soft_payload=prep_error + hint,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
+            return prep_error + hint, event, (
+                RuntimeError(prep_error) if spec.fail_on_tool_error else None
+            )
         try:
             if tool is not None:
                 result = await tool.execute(**params)
@@ -481,9 +808,20 @@ class AgentRunner:
                 "status": "error",
                 "detail": str(exc),
             }
+            payload = f"Error: {type(exc).__name__}: {exc}"
+            handled = self._classify_violation(
+                raw_text=str(exc),
+                # Preserve legacy exception payloads without the retry hint.
+                soft_payload=payload,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
             if spec.fail_on_tool_error:
-                return f"Error: {type(exc).__name__}: {exc}", event, exc
-            return f"Error: {type(exc).__name__}: {exc}", event, None
+                return payload, event, exc
+            return payload, event, None
 
         if isinstance(result, str) and result.startswith("Error"):
             event = {
@@ -491,9 +829,18 @@ class AgentRunner:
                 "status": "error",
                 "detail": result.replace("\n", " ").strip()[:120],
             }
+            handled = self._classify_violation(
+                raw_text=result,
+                soft_payload=result + hint,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
             if spec.fail_on_tool_error:
-                return result + _HINT, event, RuntimeError(result)
-            return result + _HINT, event, None
+                return result + hint, event, RuntimeError(result)
+            return result + hint, event, None
 
         detail = "" if result is None else str(result)
         detail = detail.replace("\n", " ").strip()
@@ -502,6 +849,98 @@ class AgentRunner:
         elif len(detail) > 120:
             detail = detail[:120] + "..."
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+
+    # SSRF is a hard security block at the tool boundary, but the agent turn
+    # should recover conversationally instead of aborting the runtime.
+    _SSRF_MARKERS: tuple[str, ...] = (
+        "internal/private url detected",
+        "private/internal address",
+        "private address",
+    )
+    _SSRF_BOUNDARY_NOTE: str = (
+        "This is a non-bypassable security boundary. Stop trying to access "
+        "private/internal URLs. Do not retry with curl, wget, encoded IPs, "
+        "alternate DNS, redirects, proxies, or another tool. Ask the user for "
+        "local files, logs, screenshots, or an explicit safe public URL instead. "
+        "If the user explicitly trusts this private URL, ask them to whitelist "
+        "the exact IP/CIDR via tools.ssrfWhitelist."
+    )
+
+    # Non-SSRF boundary markers returned to the LLM as recoverable tool errors.
+    _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
+        "outside the configured workspace",
+        "outside allowed directory",
+        "working_dir is outside",
+        "working_dir could not be resolved",
+        "path outside working dir",
+        "path traversal detected",
+    )
+
+    @classmethod
+    def _is_ssrf_violation(cls, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._SSRF_MARKERS)
+
+    @classmethod
+    def _is_workspace_violation(cls, text: str) -> bool:
+        """True when *text* looks like any policy boundary rejection."""
+        if not text:
+            return False
+        lowered = text.lower()
+        if cls._is_ssrf_violation(lowered):
+            return True
+        return any(marker in lowered for marker in cls._WORKSPACE_VIOLATION_MARKERS)
+
+    def _classify_violation(
+        self,
+        *,
+        raw_text: str,
+        soft_payload: str,
+        event: dict[str, str],
+        tool_call: ToolCallRequest,
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[Any, dict[str, str], BaseException | None] | None:
+        """Classify safety-boundary failures, or return ``None`` to pass through."""
+        if self._is_ssrf_violation(raw_text):
+            logger.warning(
+                "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
+                tool_call.name,
+                raw_text.replace("\n", " ").strip()[:200],
+            )
+            event["detail"] = self._event_detail("ssrf_violation: ", raw_text)
+            return self._ssrf_soft_payload(raw_text), event, None
+
+        if self._is_workspace_violation(raw_text):
+            escalation = repeated_workspace_violation_error(
+                tool_call.name,
+                tool_call.arguments,
+                workspace_violation_counts,
+            )
+            event["detail"] = self._event_detail("workspace_violation: ", raw_text)
+            if escalation is not None:
+                logger.warning(
+                    "Tool {} hit workspace boundary repeatedly; escalating hint",
+                    tool_call.name,
+                )
+                event["detail"] = self._event_detail(
+                    "workspace_violation_escalated: ",
+                    raw_text,
+                )
+                return escalation, event, None
+            return soft_payload, event, None
+
+        return None
+
+    @classmethod
+    def _ssrf_soft_payload(cls, raw_text: str) -> str:
+        text = raw_text.strip() or "Error: request blocked by SSRF guard"
+        return f"{text}\n\n{cls._SSRF_BOUNDARY_NOTE}"
+
+    @staticmethod
+    def _event_detail(prefix: str, text: str, limit: int = 160) -> str:
+        return (prefix + text.replace("\n", " ").strip())[:limit]
 
     async def _emit_checkpoint(
         self,
@@ -549,12 +988,11 @@ class AgentRunner:
                 result,
                 max_chars=spec.max_tool_result_chars,
             )
-        except Exception as exc:
-            logger.warning(
-                "Tool result persist failed for {} in {}: {}; using raw result",
+        except Exception:
+            logger.exception(
+                "Tool result persist failed for {} in {}; using raw result",
                 tool_call_id,
                 spec.session_key or "default",
-                exc,
             )
             content = result
         if isinstance(content, str) and len(content) > spec.max_tool_result_chars:
@@ -724,6 +1162,16 @@ class AgentRunner:
                 if message.get("role") == "user":
                     kept = kept[i:]
                     break
+            else:
+                # Recover nearest user message from outside the kept window;
+                # GLM rejects system→assistant (error 1214).  Budget is
+                # intentionally exceeded — oversized beats invalid.
+                for idx in range(len(non_system) - 1, -1, -1):
+                    if non_system[idx].get("role") == "user":
+                        kept = non_system[idx:]
+                        break
+                # If no user exists at all, _enforce_role_alternation
+                # will insert a synthetic one as a safety net.
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
@@ -758,4 +1206,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-

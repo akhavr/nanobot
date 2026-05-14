@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,9 +11,26 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.subagent import SubagentManager, SubagentStatus
 from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.web import WebSearchTool
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import WebSearchConfig
+
+
+@pytest.mark.asyncio
+async def test_web_search_tool_refreshes_dynamic_config_loader(monkeypatch) -> None:
+    tool = WebSearchTool(
+        config=WebSearchConfig(provider="brave"),
+        config_loader=lambda: WebSearchConfig(provider="duckduckgo", max_results=3),
+    )
+
+    async def fake_duckduckgo(self, query: str, n: int) -> str:
+        return f"{self.config.provider}:{query}:{n}"
+
+    monkeypatch.setattr(WebSearchTool, "_search_duckduckgo", fake_duckduckgo)
+
+    assert await tool.execute("nanobot") == "duckduckgo:nanobot:3"
 
 
 @pytest.mark.asyncio
@@ -179,9 +197,13 @@ async def test_grep_files_with_matches_supports_head_limit_and_offset(tmp_path: 
         offset=1,
     )
 
-    lines = result.splitlines()
-    assert lines[0] == "src/b.py"
+    # Filesystem order is not deterministic across platforms, so just verify:
+    # 1. Only one file path is returned (head_limit=1 after offset=1)
+    # 2. The pagination info is correct
     assert "pagination: limit=1, offset=1" in result
+    # Count non-empty lines that start with src/ (file paths)
+    file_lines = [line for line in result.splitlines() if line.startswith("src/")]
+    assert len(file_lines) == 1
 
 
 @pytest.mark.asyncio
@@ -319,7 +341,32 @@ async def test_subagent_registers_grep_and_glob(tmp_path: Path) -> None:
     mgr.runner.run = fake_run
     mgr._announce_result = AsyncMock()
 
-    await mgr._run_subagent("sub-1", "search task", "label", {"channel": "cli", "chat_id": "direct"})
+    status = SubagentStatus(task_id="sub-1", label="label", task_description="search task", started_at=time.monotonic())
+    await mgr._run_subagent("sub-1", "search task", "label", {"channel": "cli", "chat_id": "direct"}, status)
 
     assert "grep" in captured["tool_names"]
     assert "glob" in captured["tool_names"]
+
+
+def test_subagent_prompt_respects_disabled_skills(tmp_path: Path) -> None:
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "alpha").mkdir(parents=True)
+    (skills_dir / "alpha" / "SKILL.md").write_text("# Alpha\n\nhidden\n", encoding="utf-8")
+    (skills_dir / "beta").mkdir(parents=True)
+    (skills_dir / "beta" / "SKILL.md").write_text("# Beta\n\nshown\n", encoding="utf-8")
+
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=4096,
+        disabled_skills=["alpha"],
+    )
+
+    prompt = mgr._build_subagent_prompt()
+
+    assert "alpha" not in prompt
+    assert "beta" in prompt

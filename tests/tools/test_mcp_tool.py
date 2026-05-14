@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
 import sys
+from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import nanobot.agent.tools.mcp as mcp_mod
 from nanobot.agent.tools.mcp import (
-    MCPResourceWrapper,
     MCPPromptWrapper,
+    MCPResourceWrapper,
     MCPToolWrapper,
+    _normalize_windows_stdio_command,
+    _sanitize_name,
     connect_mcp_servers,
 )
 from nanobot.agent.tools.registry import ToolRegistry
@@ -178,6 +181,99 @@ def test_wrapper_normalizes_nullable_property_anyof() -> None:
     }
 
 
+def test_normalize_windows_stdio_command_is_noop_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "posix", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "npx",
+        ["-y", "chrome-devtools-mcp@latest"],
+        {"FOO": "bar"},
+    )
+
+    assert command == "npx"
+    assert args == ["-y", "chrome-devtools-mcp@latest"]
+    assert env == {"FOO": "bar"}
+
+
+def test_normalize_windows_stdio_command_wraps_npx_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        mcp_mod.shutil,
+        "which",
+        lambda command, path=None: r"C:\Program Files\nodejs\npx.cmd",
+    )
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    command, args, env = _normalize_windows_stdio_command(
+        "npx",
+        ["-y", "chrome-devtools-mcp@latest"],
+        None,
+    )
+
+    assert command == r"C:\Windows\System32\cmd.exe"
+    assert args == ["/d", "/c", "npx", "-y", "chrome-devtools-mcp@latest"]
+    assert env is None
+
+
+def test_normalize_windows_stdio_command_wraps_resolved_cmd_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    def _fake_which(command: str, path: str | None = None) -> str:
+        assert command == "custom-launcher"
+        assert path == r"C:\Tools"
+        return r"C:\Tools\custom-launcher.cmd"
+
+    monkeypatch.setattr(mcp_mod.shutil, "which", _fake_which)
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    command, args, _env = _normalize_windows_stdio_command(
+        "custom-launcher",
+        ["serve"],
+        {"PATH": r"C:\Tools"},
+    )
+
+    assert command == r"C:\Windows\System32\cmd.exe"
+    assert args == ["/d", "/c", "custom-launcher", "serve"]
+
+
+def test_normalize_windows_stdio_command_keeps_real_executables_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "python.exe",
+        ["-m", "http.server"],
+        {"FOO": "bar"},
+    )
+
+    assert command == "python.exe"
+    assert args == ["-m", "http.server"]
+    assert env == {"FOO": "bar"}
+
+
+def test_normalize_windows_stdio_command_skips_existing_shells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "cmd.exe",
+        ["/c", "echo", "hello"],
+        None,
+    )
+
+    assert command == "cmd.exe"
+    assert args == ["/c", "echo", "hello"]
+    assert env is None
+
+
 @pytest.mark.asyncio
 async def test_execute_returns_text_blocks() -> None:
     async def call_tool(_name: str, arguments: dict) -> object:
@@ -271,15 +367,11 @@ async def test_connect_mcp_servers_enabled_tools_supports_raw_names(
 ) -> None:
     fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
     registry = ToolRegistry()
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake", enabled_tools=["demo"])},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["demo"])},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo"]
@@ -291,15 +383,11 @@ async def test_connect_mcp_servers_enabled_tools_defaults_to_all(
 ) -> None:
     fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
     registry = ToolRegistry()
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake")},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake")},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo", "mcp_test_other"]
@@ -311,15 +399,11 @@ async def test_connect_mcp_servers_enabled_tools_supports_wrapped_names(
 ) -> None:
     fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
     registry = ToolRegistry()
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake", enabled_tools=["mcp_test_demo"])},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["mcp_test_demo"])},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo"]
@@ -331,15 +415,11 @@ async def test_connect_mcp_servers_enabled_tools_empty_list_registers_none(
 ) -> None:
     fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
     registry = ToolRegistry()
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake", enabled_tools=[])},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=[])},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert registry.tool_names == []
@@ -358,15 +438,11 @@ async def test_connect_mcp_servers_enabled_tools_warns_on_unknown_entries(
 
     monkeypatch.setattr("nanobot.agent.tools.mcp.logger.warning", _warning)
 
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake", enabled_tools=["unknown"])},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["unknown"])},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert registry.tool_names == []
@@ -374,6 +450,115 @@ async def test_connect_mcp_servers_enabled_tools_warns_on_unknown_entries(
     assert "enabledTools entries not found: unknown" in warnings[-1]
     assert "Available raw names: demo" in warnings[-1]
     assert "Available wrapped names: mcp_test_demo" in warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_logs_stdio_pollution_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+
+    def _error(message: str, *args: object) -> None:
+        messages.append(message.format(*args))
+
+    @asynccontextmanager
+    async def _broken_stdio_client(_params: object):
+        raise RuntimeError("Parse error: Unexpected token 'INFO' before JSON-RPC headers")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _broken_stdio_client)
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.exception", _error)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers({"gh": MCPServerConfig(command="github-mcp")}, registry)
+
+    assert stacks == {}
+    assert messages
+    assert "stdio protocol pollution" in messages[-1]
+    assert "stdout" in messages[-1]
+    assert "stderr" in messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_one_failure_does_not_block_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = {"good": _make_fake_session(["demo"])}
+
+    class _SelectiveClientSession:
+        def __init__(self, read: object, _write: object) -> None:
+            self._session = sessions[read]
+
+        async def __aenter__(self) -> object:
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    @asynccontextmanager
+    async def _selective_stdio_client(params: object):
+        if params.command == "bad":
+            raise RuntimeError("boom")
+        yield params.command, object()
+
+    monkeypatch.setattr(sys.modules["mcp"], "ClientSession", _SelectiveClientSession)
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _selective_stdio_client)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "good": MCPServerConfig(command="good"),
+            "bad": MCPServerConfig(command="bad"),
+        },
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_good_demo"]
+    assert set(stacks) == {"good"}
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_wraps_windows_stdio_launchers(
+    fake_mcp_runtime: dict[str, object | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def _capturing_stdio_client(params: object):
+        captured["command"] = params.command
+        captured["args"] = params.args
+        captured["env"] = params.env
+        yield object(), object()
+
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        mcp_mod.shutil,
+        "which",
+        lambda command, path=None: r"C:\Program Files\nodejs\npx.cmd",
+    )
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _capturing_stdio_client)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "test": MCPServerConfig(
+                command="npx",
+                args=["-y", "chrome-devtools-mcp@latest"],
+            )
+        },
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert captured["command"] == r"C:\Windows\System32\cmd.exe"
+    assert captured["args"] == ["/d", "/c", "npx", "-y", "chrome-devtools-mcp@latest"]
+    assert captured["env"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -389,9 +574,7 @@ def _make_resource_def(
     return SimpleNamespace(name=name, uri=uri, description=description)
 
 
-def _make_resource_wrapper(
-    session: object, *, timeout: float = 0.1
-) -> MCPResourceWrapper:
+def _make_resource_wrapper(session: object, *, timeout: float = 0.1) -> MCPResourceWrapper:
     return MCPResourceWrapper(session, "srv", _make_resource_def(), resource_timeout=timeout)
 
 
@@ -434,9 +617,7 @@ async def test_resource_wrapper_execute_handles_timeout() -> None:
         await asyncio.sleep(1)
         return SimpleNamespace(contents=[])
 
-    wrapper = _make_resource_wrapper(
-        SimpleNamespace(read_resource=read_resource), timeout=0.01
-    )
+    wrapper = _make_resource_wrapper(SimpleNamespace(read_resource=read_resource), timeout=0.01)
     result = await wrapper.execute()
     assert result == "(MCP resource read timed out after 0.01s)"
 
@@ -464,20 +645,14 @@ def _make_prompt_def(
     return SimpleNamespace(name=name, description=description, arguments=arguments)
 
 
-def _make_prompt_wrapper(
-    session: object, *, timeout: float = 0.1
-) -> MCPPromptWrapper:
-    return MCPPromptWrapper(
-        session, "srv", _make_prompt_def(), prompt_timeout=timeout
-    )
+def _make_prompt_wrapper(session: object, *, timeout: float = 0.1) -> MCPPromptWrapper:
+    return MCPPromptWrapper(session, "srv", _make_prompt_def(), prompt_timeout=timeout)
 
 
 def test_prompt_wrapper_properties() -> None:
     arg1 = SimpleNamespace(name="topic", required=True)
     arg2 = SimpleNamespace(name="style", required=False)
-    wrapper = MCPPromptWrapper(
-        None, "myserver", _make_prompt_def(arguments=[arg1, arg2])
-    )
+    wrapper = MCPPromptWrapper(None, "myserver", _make_prompt_def(arguments=[arg1, arg2]))
     assert wrapper.name == "mcp_myserver_prompt_myprompt"
     assert "[MCP Prompt]" in wrapper.description
     assert "A test prompt" in wrapper.description
@@ -528,9 +703,7 @@ async def test_prompt_wrapper_execute_handles_timeout() -> None:
         await asyncio.sleep(1)
         return SimpleNamespace(messages=[])
 
-    wrapper = _make_prompt_wrapper(
-        SimpleNamespace(get_prompt=get_prompt), timeout=0.01
-    )
+    wrapper = _make_prompt_wrapper(SimpleNamespace(get_prompt=get_prompt), timeout=0.01)
     result = await wrapper.execute()
     assert result == "(MCP prompt call timed out after 0.01s)"
 
@@ -616,17 +789,124 @@ async def test_connect_registers_resources_and_prompts(
         prompt_names=["prompt_c"],
     )
     registry = ToolRegistry()
-    stack = AsyncExitStack()
-    await stack.__aenter__()
-    try:
-        await connect_mcp_servers(
-            {"test": MCPServerConfig(command="fake")},
-            registry,
-            stack,
-        )
-    finally:
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake")},
+        registry,
+    )
+    for stack in stacks.values():
         await stack.aclose()
 
     assert "mcp_test_tool_a" in registry.tool_names
     assert "mcp_test_resource_res_b" in registry.tool_names
     assert "mcp_test_prompt_prompt_c" in registry.tool_names
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_name tests
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_name_replaces_spaces() -> None:
+    assert _sanitize_name("PostgreSQL System Information") == "PostgreSQL_System_Information"
+
+
+def test_sanitize_name_replaces_special_characters() -> None:
+    assert _sanitize_name("foo.bar@baz!") == "foo_bar_baz_"
+
+
+def test_sanitize_name_collapses_consecutive_underscores() -> None:
+    assert _sanitize_name("a   b") == "a_b"
+
+
+def test_sanitize_name_preserves_valid_characters() -> None:
+    assert _sanitize_name("my-tool_v2") == "my-tool_v2"
+
+
+def test_sanitize_name_noop_for_already_clean_names() -> None:
+    assert _sanitize_name("mcp_server_tool") == "mcp_server_tool"
+
+
+# ---------------------------------------------------------------------------
+# Wrapper sanitization tests
+# ---------------------------------------------------------------------------
+
+
+def test_tool_wrapper_sanitizes_name() -> None:
+    tool_def = SimpleNamespace(
+        name="My Tool",
+        description="tool with spaces",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "srv", tool_def)
+    assert wrapper.name == "mcp_srv_My_Tool"
+
+
+def test_resource_wrapper_sanitizes_name() -> None:
+    resource_def = SimpleNamespace(
+        name="PostgreSQL System Information",
+        uri="file:///pg/info",
+        description="PG info",
+    )
+    wrapper = MCPResourceWrapper(None, "srv", resource_def)
+    assert wrapper.name == "mcp_srv_resource_PostgreSQL_System_Information"
+
+
+def test_prompt_wrapper_sanitizes_name() -> None:
+    prompt_def = SimpleNamespace(
+        name="design-schema",
+        description="Design schema",
+        arguments=None,
+    )
+    # Hyphens are allowed, so this should pass through unchanged
+    wrapper = MCPPromptWrapper(None, "my server", prompt_def)
+    assert wrapper.name == "mcp_my_server_prompt_design-schema"
+
+
+def test_tool_wrapper_preserves_original_name_for_mcp_call() -> None:
+    tool_def = SimpleNamespace(
+        name="My Tool",
+        description="tool with spaces",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "srv", tool_def)
+    # The sanitized API-facing name differs from the original MCP name
+    assert wrapper.name == "mcp_srv_My_Tool"
+    assert wrapper._original_name == "My Tool"
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_sanitizes_resource_names(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session_with_capabilities(
+        tool_names=[],
+        resource_names=["PostgreSQL System Information"],
+        prompt_names=[],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake")},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert "mcp_test_resource_PostgreSQL_System_Information" in registry.tool_names
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_enabled_tools_matches_sanitized_name(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session_with_capabilities(
+        tool_names=["My Tool", "other"],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["mcp_test_My_Tool"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_My_Tool"]

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from contextlib import suppress
+from dataclasses import dataclass
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
@@ -13,19 +15,100 @@ from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 
 
+@dataclass(frozen=True)
+class BuiltinCommandSpec:
+    command: str
+    title: str
+    description: str
+    icon: str
+    arg_hint: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "command": self.command,
+            "title": self.title,
+            "description": self.description,
+            "icon": self.icon,
+            "arg_hint": self.arg_hint,
+        }
+
+
+BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
+    BuiltinCommandSpec(
+        "/new",
+        "New chat",
+        "Stop the current task and start a fresh conversation.",
+        "square-pen",
+    ),
+    BuiltinCommandSpec(
+        "/stop",
+        "Stop current task",
+        "Cancel the active agent turn for this chat.",
+        "square",
+    ),
+    BuiltinCommandSpec(
+        "/restart",
+        "Restart nanobot",
+        "Restart the bot process in place.",
+        "rotate-cw",
+    ),
+    BuiltinCommandSpec(
+        "/status",
+        "Show status",
+        "Display runtime, provider, and channel status.",
+        "activity",
+    ),
+    BuiltinCommandSpec(
+        "/model",
+        "Switch model preset",
+        "Show or switch the active model preset.",
+        "brain",
+        "[preset]",
+    ),
+    BuiltinCommandSpec(
+        "/history",
+        "Show conversation history",
+        "Print the last N persisted conversation messages.",
+        "history",
+        "[n]",
+    ),
+    BuiltinCommandSpec(
+        "/dream",
+        "Run Dream",
+        "Manually trigger memory consolidation.",
+        "sparkles",
+    ),
+    BuiltinCommandSpec(
+        "/dream-log",
+        "Show Dream log",
+        "Show what the last Dream consolidation changed.",
+        "book-open",
+    ),
+    BuiltinCommandSpec(
+        "/dream-restore",
+        "Restore memory",
+        "Revert memory to a previous Dream snapshot.",
+        "undo-2",
+    ),
+    BuiltinCommandSpec(
+        "/help",
+        "Show help",
+        "List available slash commands.",
+        "circle-help",
+    ),
+)
+
+
+def builtin_command_palette() -> list[dict[str, str]]:
+    """Return structured command metadata for UI command palettes."""
+    return [spec.as_dict() for spec in BUILTIN_COMMAND_SPECS]
+
+
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
-    tasks = loop._active_tasks.pop(msg.session_key, [])
-    cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-    for t in tasks:
-        try:
-            await t
-        except (asyncio.CancelledError, Exception):
-            pass
-    sub_cancelled = await loop.subagents.cancel_by_session(msg.session_key)
-    total = cancelled + sub_cancelled
+    total = await loop._cancel_active_tasks(msg.session_key)
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
@@ -36,7 +119,11 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
-    set_restart_notice_to_env(channel=msg.channel, chat_id=msg.chat_id)
+    set_restart_notice_to_env(
+        channel=msg.channel,
+        chat_id=msg.chat_id,
+        metadata=dict(msg.metadata or {}),
+    )
 
     async def _do_restart():
         await asyncio.sleep(1)
@@ -54,16 +141,15 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     ctx_est = 0
-    try:
+    with suppress(Exception):
         ctx_est, _ = loop.consolidator.estimate_session_prompt_tokens(session)
-    except Exception:
-        pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
-    
+
     # Fetch web search provider usage (best-effort, never blocks the response)
     search_usage_text: str | None = None
-    try:
+    # Never let usage fetch break /status
+    with suppress(Exception):
         from nanobot.utils.searchusage import fetch_search_usage
         web_cfg = getattr(loop, "web_config", None)
         search_cfg = getattr(web_cfg, "search", None) if web_cfg else None
@@ -72,8 +158,10 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             api_key = getattr(search_cfg, "api_key", "") or None
             usage = await fetch_search_usage(provider=provider, api_key=api_key)
             search_usage_text = usage.format()
-    except Exception:
-        pass  # Never let usage fetch break /status
+    active_tasks = loop._active_tasks.get(ctx.key, [])
+    task_count = sum(1 for t in active_tasks if not t.done())
+    with suppress(Exception):
+        task_count += loop.subagents.get_running_count_by_session(ctx.key)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -84,14 +172,19 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
             search_usage_text=search_usage_text,
+            active_task_count=task_count,
+            max_completion_tokens=getattr(
+                getattr(loop.provider, "generation", None), "max_tokens", 8192
+            ),
         ),
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session."""
+    """Stop active task and start a fresh session."""
     loop = ctx.loop
+    await loop._cancel_active_tasks(ctx.key)
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
@@ -103,6 +196,89 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content="New session started.",
         metadata=dict(ctx.msg.metadata or {})
+    )
+
+
+def _format_preset_names(names: list[str]) -> str:
+    return ", ".join(f"`{name}`" for name in names) if names else "(none configured)"
+
+
+def _model_preset_names(loop) -> list[str]:
+    names = set(loop.model_presets)
+    names.add("default")
+    return ["default", *sorted(name for name in names if name != "default")]
+
+
+def _active_model_preset_name(loop) -> str:
+    return loop.model_preset or "default"
+
+
+def _command_error_message(exc: Exception) -> str:
+    return str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
+
+
+def _model_command_status(loop) -> str:
+    names = _model_preset_names(loop)
+    active = _active_model_preset_name(loop)
+    return "\n".join([
+        "## Model",
+        f"- Current model: `{loop.model}`",
+        f"- Current preset: `{active}`",
+        f"- Available presets: {_format_preset_names(names)}",
+    ])
+
+
+async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+    """Show or switch model presets."""
+    loop = ctx.loop
+    args = ctx.args.strip()
+    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+
+    if not args:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=_model_command_status(loop),
+            metadata=metadata,
+        )
+
+    parts = args.split()
+    if len(parts) != 1:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: `/model [preset]`",
+            metadata=metadata,
+        )
+
+    name = parts[0]
+    try:
+        loop.set_model_preset(name)
+    except (KeyError, ValueError) as exc:
+        names = _model_preset_names(loop)
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=(
+                f"Could not switch model preset: {_command_error_message(exc)}\n\n"
+                f"Available presets: {_format_preset_names(names)}"
+            ),
+            metadata=metadata,
+        )
+
+    max_tokens = getattr(getattr(loop.provider, "generation", None), "max_tokens", None)
+    lines = [
+        f"Switched model preset to `{loop.model_preset}`.",
+        f"- Model: `{loop.model}`",
+        f"- Context window: {loop.context_window_tokens}",
+    ]
+    if max_tokens is not None:
+        lines.append(f"- Max output tokens: {max_tokens}")
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content="\n".join(lines),
+        metadata=metadata,
     )
 
 
@@ -303,6 +479,66 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+_HISTORY_DEFAULT_COUNT = 10
+_HISTORY_MAX_COUNT = 50
+_HISTORY_MAX_CONTENT_CHARS = 200
+
+
+def _format_history_message(msg: dict) -> str | None:
+    """Format a single history message for display. Returns None to skip."""
+    role = msg.get("role")
+    if role not in ("user", "assistant"):
+        return None
+    content = msg.get("content") or ""
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        content = " ".join(parts)
+    content = str(content).strip()
+    if not content:
+        return None
+    if len(content) > _HISTORY_MAX_CONTENT_CHARS:
+        content = content[:_HISTORY_MAX_CONTENT_CHARS] + "…"
+    label = "👤 You" if role == "user" else "🤖 Bot"
+    return f"{label}: {content}"
+
+
+async def cmd_history(ctx: CommandContext) -> OutboundMessage:
+    """Show the last N messages of the current session (default 10, max 50).
+
+    Usage: /history [count]
+    """
+    count = _HISTORY_DEFAULT_COUNT
+    if ctx.args.strip():
+        try:
+            count = max(1, min(int(ctx.args.strip()), _HISTORY_MAX_COUNT))
+        except ValueError:
+            return OutboundMessage(
+                channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+                content="Usage: /history [count] — e.g. /history 5 (default: 10, max: 50)",
+                metadata=dict(ctx.msg.metadata or {}),
+            )
+
+    session = ctx.session or ctx.loop.sessions.get_or_create(ctx.key)
+    history = session.get_history(max_messages=0)
+    visible = [_format_history_message(m) for m in history]
+    visible = [m for m in visible if m is not None]
+    recent = visible[-count:]
+
+    if not recent:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="No conversation history yet.",
+            metadata=dict(ctx.msg.metadata or {}),
+        )
+
+    header = f"Last {len(recent)} message(s):\n"
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=header + "\n".join(recent),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     return OutboundMessage(
@@ -315,17 +551,12 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
-    lines = [
-        "🐈 nanobot commands:",
-        "/new — Start a new conversation",
-        "/stop — Stop the current task",
-        "/restart — Restart the bot",
-        "/status — Show bot status",
-        "/dream — Manually trigger Dream consolidation",
-        "/dream-log — Show what the last Dream changed",
-        "/dream-restore — Revert memory to a previous state",
-        "/help — Show available commands",
-    ]
+    lines = ["🐈 nanobot commands:"]
+    for spec in BUILTIN_COMMAND_SPECS:
+        command = spec.command
+        if spec.arg_hint:
+            command = f"{command} {spec.arg_hint}"
+        lines.append(f"{command} — {spec.description}")
     return "\n".join(lines)
 
 
@@ -336,6 +567,10 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/model", cmd_model)
+    router.prefix("/model ", cmd_model)
+    router.exact("/history", cmd_history)
+    router.prefix("/history ", cmd_history)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

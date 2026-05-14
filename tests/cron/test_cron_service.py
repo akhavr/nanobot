@@ -8,6 +8,15 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 
 
+async def _wait_until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+    assert predicate()
+
+
 def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
 
@@ -32,6 +41,59 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
 
     assert job.schedule.tz == "America/Vancouver"
     assert job.state.next_run_at_ms is not None
+
+
+def test_add_job_preserves_channel_meta_and_session_key(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    meta = {"slack": {"thread_ts": "1234567890.123456", "channel_type": "channel"}}
+    job = service.add_job(
+        name="thread test",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        deliver=True,
+        channel="slack",
+        to="C123",
+        channel_meta=meta,
+        session_key="slack:C123:1234567890.123456",
+    )
+    assert job.payload.channel_meta == meta
+    assert job.payload.session_key == "slack:C123:1234567890.123456"
+
+    reloaded = service.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.payload.channel_meta == meta
+    assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
+
+
+@pytest.mark.asyncio
+async def test_channel_meta_and_session_key_survive_store_reload(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    await service.start()
+    meta = {"slack": {"thread_ts": "1234567890.123456", "channel_type": "channel"}}
+    try:
+        job = service.add_job(
+            name="thread test",
+            schedule=CronSchedule(kind="every", every_ms=60_000),
+            message="hello",
+            deliver=True,
+            channel="slack",
+            to="C123",
+            channel_meta=meta,
+            session_key="slack:C123:1234567890.123456",
+        )
+    finally:
+        service.stop()
+
+    raw = json.loads(store_path.read_text(encoding="utf-8"))
+    payload = raw["jobs"][0]["payload"]
+    assert payload["channelMeta"] == meta
+    assert payload["sessionKey"] == "slack:C123:1234567890.123456"
+
+    reloaded = CronService(store_path).get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.payload.channel_meta == meta
+    assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
 
 
 @pytest.mark.asyncio
@@ -166,8 +228,9 @@ async def test_running_service_honors_external_disable(tmp_path) -> None:
     )
     await service.start()
     try:
-        # Wait slightly to ensure file mtime is definitively different
-        await asyncio.sleep(0.05)
+        # Disable before yielding back to the event loop. On slower Windows CI
+        # a short sleep here can overrun the 200ms schedule and let the job fire
+        # before the external update is written.
         external = CronService(store_path)
         updated = external.enable_job(job.id, enabled=False)
         assert updated is not None
@@ -201,18 +264,18 @@ async def test_start_server_not_jobs(tmp_path):
     async def on_job(job):
         called.append(job.name)
 
-    service = CronService(store_path, on_job=on_job, max_sleep_ms=1000)
+    service = CronService(store_path, on_job=on_job, max_sleep_ms=100)
     await service.start()
     assert len(service.list_jobs()) == 0
 
     service2 = CronService(tmp_path / "cron" / "jobs.json")
     service2.add_job(
         name="hist",
-        schedule=CronSchedule(kind="every", every_ms=500),
+        schedule=CronSchedule(kind="every", every_ms=100),
         message="hello",
     )
     assert len(service.list_jobs()) == 1
-    await asyncio.sleep(2)
+    await _wait_until(lambda: bool(called), timeout=0.8)
     assert len(called) != 0
     service.stop()
 
@@ -248,10 +311,10 @@ async def test_running_service_picks_up_external_add(tmp_path):
     async def on_job(job):
         called.append(job.name)
 
-    service = CronService(store_path, on_job=on_job)
+    service = CronService(store_path, on_job=on_job, max_sleep_ms=100)
     service.add_job(
         name="heartbeat",
-        schedule=CronSchedule(kind="every", every_ms=150),
+        schedule=CronSchedule(kind="every", every_ms=100),
         message="tick",
     )
     await service.start()
@@ -261,11 +324,11 @@ async def test_running_service_picks_up_external_add(tmp_path):
         external = CronService(store_path)
         external.add_job(
             name="external",
-            schedule=CronSchedule(kind="every", every_ms=150),
+            schedule=CronSchedule(kind="every", every_ms=100),
             message="ping",
         )
 
-        await asyncio.sleep(2)
+        await _wait_until(lambda: "external" in called, timeout=0.8)
         assert "external" in called
     finally:
         service.stop()
@@ -287,16 +350,16 @@ async def test_add_job_during_jobs_exec(tmp_path):
             )
             run_once = False
 
-    service = CronService(store_path, on_job=on_job)
+    service = CronService(store_path, on_job=on_job, max_sleep_ms=100)
     service.add_job(
         name="heartbeat",
-        schedule=CronSchedule(kind="every", every_ms=150),
+        schedule=CronSchedule(kind="every", every_ms=100),
         message="tick",
     )
     assert len(service.list_jobs()) == 1
     await service.start()
     try:
-        await asyncio.sleep(3)
+        await _wait_until(lambda: len(service.list_jobs()) == 2, timeout=0.8)
         jobs = service.list_jobs()
         assert len(jobs) == 2
         assert "test" in [j.name for j in jobs]
@@ -327,6 +390,45 @@ async def test_external_update_preserves_run_history_records(tmp_path):
 
     fresh._running = True
     fresh._save_store()
+
+
+# ── timer race regression tests ──
+
+
+@pytest.mark.asyncio
+async def test_timer_execution_is_not_rolled_back_by_list_jobs_reload(tmp_path):
+    """list_jobs() during _on_timer should not replace the active store and re-run the same due job."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    calls: list[str] = []
+
+    async def on_job(job):
+        calls.append(job.id)
+        # Simulate frontend polling list_jobs while the timer callback is mid-execution.
+        service.list_jobs(include_disabled=True)
+        await asyncio.sleep(0)
+
+    service = CronService(store_path, on_job=on_job)
+    service._running = True
+    service._load_store()
+    service._arm_timer = lambda: None
+
+    job = service.add_job(
+        name="race",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+    job.state.next_run_at_ms = max(1, int(time.time() * 1000) - 1_000)
+    service._save_store()
+
+    await service._on_timer()
+    await service._on_timer()
+
+    assert calls == [job.id]
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    assert loaded.state.last_run_at_ms is not None
+    assert loaded.state.next_run_at_ms is not None
+    assert loaded.state.next_run_at_ms > loaded.state.last_run_at_ms
 
 
 # ── update_job tests ──
@@ -451,7 +553,7 @@ def test_update_job_offline_writes_action(tmp_path) -> None:
 
     action_path = tmp_path / "cron" / "action.jsonl"
     assert action_path.exists()
-    lines = [l for l in action_path.read_text().strip().split("\n") if l]
+    lines = [line for line in action_path.read_text().strip().split("\n") if line]
     last = json.loads(lines[-1])
     assert last["action"] == "update"
     assert last["params"]["name"] == "updated-offline"
@@ -479,3 +581,49 @@ def test_update_job_sentinel_channel_and_to(tmp_path) -> None:
     assert isinstance(result, CronJob)
     assert result.payload.channel is None
     assert result.payload.to is None
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_during_on_job_does_not_cause_stale_reload(tmp_path) -> None:
+    """Regression: if the bot calls list_jobs (which reloads from disk) during
+    on_job execution, the in-memory next_run_at_ms update must not be lost.
+    Previously this caused an infinite re-trigger loop."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    execution_count = 0
+
+    async def on_job_that_lists(job):
+        nonlocal execution_count
+        execution_count += 1
+        # Simulate the bot calling cron(action=list) mid-execution
+        service.list_jobs()
+
+    service = CronService(store_path, on_job=on_job_that_lists, max_sleep_ms=100)
+    await service.start()
+
+    # Add two jobs scheduled in the past so they're immediately due
+    now_ms = int(time.time() * 1000)
+    for name in ("job-a", "job-b"):
+        service.add_job(
+            name=name,
+            schedule=CronSchedule(kind="every", every_ms=3_600_000),
+            message="test",
+        )
+    # Force next_run to the past so _on_timer picks them up
+    for job in service._store.jobs:
+        job.state.next_run_at_ms = now_ms - 1000
+    service._save_store()
+    service._arm_timer()
+
+    # Let the timer fire once
+    await asyncio.sleep(0.3)
+    service.stop()
+
+    # Each job should have run exactly once, not looped
+    assert execution_count == 2
+
+    # Verify next_run_at_ms was persisted correctly (in the future)
+    raw = json.loads(store_path.read_text())
+    for j in raw["jobs"]:
+        next_run = j["state"]["nextRunAtMs"]
+        assert next_run is not None
+        assert next_run > now_ms, f"Job '{j['name']}' next_run should be in the future"

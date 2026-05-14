@@ -4,7 +4,7 @@ import json
 import types
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, NamedTuple, get_args, get_origin
+from typing import Any, Literal, NamedTuple, get_args, get_origin
 
 try:
     import questionary
@@ -191,17 +191,19 @@ def _get_field_type_info(field_info) -> FieldTypeInfo:
             origin = get_origin(annotation)
             args = get_args(annotation)
 
-    _SIMPLE_TYPES: dict[type, str] = {bool: "bool", int: "int", float: "float"}
+    _simple_types: dict[type, str] = {bool: "bool", int: "int", float: "float"}
 
     if origin is list or (hasattr(origin, "__name__") and origin.__name__ == "List"):
         return FieldTypeInfo("list", args[0] if args else str)
     if origin is dict or (hasattr(origin, "__name__") and origin.__name__ == "Dict"):
         return FieldTypeInfo("dict", None)
-    for py_type, name in _SIMPLE_TYPES.items():
+    for py_type, name in _simple_types.items():
         if annotation is py_type:
             return FieldTypeInfo(name, None)
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         return FieldTypeInfo("model", annotation)
+    if origin is Literal:
+        return FieldTypeInfo("literal", list(args))
     return FieldTypeInfo("str", None)
 
 
@@ -264,7 +266,12 @@ def _format_value(value: Any, rich: bool = True, field_name: str = "") -> str:
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     if isinstance(value, dict):
-        return json.dumps(value)
+        # Handle dicts containing BaseModel instances
+        parts = []
+        for k, v in value.items():
+            formatted = _format_value(v, rich=False, field_name=str(k))
+            parts.append(f"{k}: {formatted}")
+        return ", ".join(parts) if parts else ("[dim]not set[/dim]" if rich else "[not set]")
     return str(value)
 
 
@@ -277,6 +284,63 @@ def _format_value_for_input(value: Any, field_type: str) -> str:
     if field_type == "dict" and isinstance(value, dict):
         return json.dumps(value)
     return str(value)
+
+
+def _validate_field_constraint(value: Any, field_info) -> str | None:
+    """Validate a value against Pydantic Field constraints.
+
+    Returns an error message string if validation fails, None if valid.
+    Uses attribute-based detection to handle Pydantic v2 internal types.
+    """
+    if field_info is None or not hasattr(field_info, "metadata"):
+        return None
+
+    for m in field_info.metadata:
+        if hasattr(m, "ge") and isinstance(value, (int, float)):
+            if value < m.ge:
+                return f"Value must be >= {m.ge}"
+        if hasattr(m, "gt") and isinstance(value, (int, float)):
+            if value <= m.gt:
+                return f"Value must be > {m.gt}"
+        if hasattr(m, "le") and isinstance(value, (int, float)):
+            if value > m.le:
+                return f"Value must be <= {m.le}"
+        if hasattr(m, "lt") and isinstance(value, (int, float)):
+            if value >= m.lt:
+                return f"Value must be < {m.lt}"
+        if hasattr(m, "min_length") and hasattr(value, "__len__"):
+            if len(value) < m.min_length:
+                return f"Length must be >= {m.min_length}"
+        if hasattr(m, "max_length") and hasattr(value, "__len__"):
+            if len(value) > m.max_length:
+                return f"Length must be <= {m.max_length}"
+
+    return None
+
+
+def _get_constraint_hint(field_info) -> str:
+    """Derive a human-readable constraint hint from field metadata.
+
+    Returns a string like "(0-10)" or "(>= 0)" to append to field display names.
+    """
+    if field_info is None or not hasattr(field_info, "metadata"):
+        return ""
+
+    ge_val = None
+    le_val = None
+    for m in field_info.metadata:
+        if hasattr(m, "ge"):
+            ge_val = m.ge
+        if hasattr(m, "le"):
+            le_val = m.le
+
+    if ge_val is not None and le_val is not None:
+        return f" ({ge_val}-{le_val})"
+    if ge_val is not None:
+        return f" (>= {ge_val})"
+    if le_val is not None:
+        return f" (<= {le_val})"
+    return ""
 
 
 # --- Rich UI Components ---
@@ -333,27 +397,39 @@ def _input_bool(display_name: str, current: bool | None) -> bool | None:
     ).ask()
 
 
-def _input_text(display_name: str, current: Any, field_type: str) -> Any:
+def _input_text(display_name: str, current: Any, field_type: str, field_info=None) -> Any:
     """Get text input and parse based on field type."""
     default = _format_value_for_input(current, field_type)
 
     value = _get_questionary().text(f"{display_name}:", default=default).ask()
 
-    if value is None or value == "":
+    if value is None:
         return None
 
     if field_type == "int":
         try:
-            return int(value)
+            parsed = int(value)
         except ValueError:
             console.print("[yellow]! Invalid number format, value not saved[/yellow]")
             return None
+        if field_info:
+            error = _validate_field_constraint(parsed, field_info)
+            if error:
+                console.print(f"[yellow]! {error}, value not saved[/yellow]")
+                return None
+        return parsed
     elif field_type == "float":
         try:
-            return float(value)
+            parsed = float(value)
         except ValueError:
             console.print("[yellow]! Invalid number format, value not saved[/yellow]")
             return None
+        if field_info:
+            error = _validate_field_constraint(parsed, field_info)
+            if error:
+                console.print(f"[yellow]! {error}, value not saved[/yellow]")
+                return None
+        return parsed
     elif field_type == "list":
         return [v.strip() for v in value.split(",") if v.strip()]
     elif field_type == "dict":
@@ -367,7 +443,7 @@ def _input_text(display_name: str, current: Any, field_type: str) -> Any:
 
 
 def _input_with_existing(
-    display_name: str, current: Any, field_type: str
+    display_name: str, current: Any, field_type: str, field_info=None
 ) -> Any:
     """Handle input with 'keep existing' option for non-empty values."""
     has_existing = current is not None and current != "" and current != {} and current != []
@@ -381,7 +457,7 @@ def _input_with_existing(
         if choice == "Keep existing value" or choice is None:
             return None
 
-    return _input_text(display_name, current, field_type)
+    return _input_text(display_name, current, field_type, field_info=field_info)
 
 
 # --- Pydantic Model Configuration ---
@@ -431,7 +507,7 @@ def _input_model_with_autocomplete(
         qmark=">",
     ).ask()
 
-    return value if value else None
+    return value if value is not None else None
 
 
 def _input_context_window_with_recommendation(
@@ -518,6 +594,15 @@ _FIELD_HANDLERS: dict[str, Any] = {
 }
 
 
+def _is_str_or_none(annotation: Any) -> bool:
+    """Check whether a field annotation is ``str | None`` (or ``Optional[str]``)."""
+    origin = get_origin(annotation)
+    if origin is None:
+        return False
+    args = get_args(annotation)
+    return str in args and type(None) in args
+
+
 def _configure_pydantic_model(
     model: BaseModel,
     display_name: str,
@@ -550,11 +635,20 @@ def _configure_pydantic_model(
             items.append(f"{display}: {formatted}")
         return items + ["[Done]"]
 
+    last_field_name: str | None = None
     while True:
         console.clear()
         _show_config_panel(display_name, working_model, fields)
         choices = get_choices()
-        answer = _select_with_back("Select field to configure:", choices)
+        default_choice = None
+        if last_field_name:
+            for idx, (fname, _) in enumerate(fields):
+                if fname == last_field_name:
+                    default_choice = choices[idx]
+                    break
+        answer = _select_with_back(
+            "Select field to configure:", choices, default=default_choice
+        )
 
         if answer is _BACK_PRESSED or answer is None:
             return None
@@ -565,10 +659,12 @@ def _configure_pydantic_model(
         if field_idx < 0 or field_idx >= len(fields):
             return None
 
+        last_field_name = fields[field_idx][0]
+
         field_name, field_info = fields[field_idx]
         current_value = getattr(working_model, field_name, None)
         ftype = _get_field_type_info(field_info)
-        field_display = _get_field_display_name(field_name, field_info)
+        field_display = _get_field_display_name(field_name, field_info) + _get_constraint_hint(field_info)
 
         # Nested Pydantic model - recurse
         if ftype.type_name == "model":
@@ -607,11 +703,24 @@ def _configure_pydantic_model(
             continue
 
         # Generic field input
+        if ftype.type_name == "literal" and ftype.inner_type:
+            select_choices = [str(v) for v in ftype.inner_type]
+            default_choice = str(current_value) if current_value in ftype.inner_type else select_choices[0]
+            new_value = _select_with_back(field_display, select_choices, default=default_choice)
+            if new_value is _BACK_PRESSED:
+                continue
+            if new_value is not None:
+                setattr(working_model, field_name, new_value)
+            continue
         if ftype.type_name == "bool":
             new_value = _input_bool(field_display, current_value)
         else:
-            new_value = _input_with_existing(field_display, current_value, ftype.type_name)
+            new_value = _input_with_existing(field_display, current_value, ftype.type_name, field_info=field_info)
         if new_value is not None:
+            # Normalize empty string to None for optional string fields so that
+            # clearing an api_key / api_base actually removes the value.
+            if new_value == "" and _is_str_or_none(field_info.annotation):
+                new_value = None
             setattr(working_model, field_name, new_value)
 
 
@@ -710,12 +819,23 @@ def _configure_providers(config: Config) -> None:
                 choices.append(display)
         return choices + ["<- Back"]
 
+    last_provider_key: str | None = None
     while True:
         try:
             console.clear()
             _show_section_header("LLM Providers", "Select a provider to configure API key and endpoint")
             choices = get_provider_choices()
-            answer = _select_with_back("Select provider:", choices)
+            default_choice = None
+            if last_provider_key:
+                display = _get_provider_names().get(last_provider_key)
+                if display:
+                    for c in choices:
+                        if c.replace(" *", "") == display:
+                            default_choice = c
+                            break
+            answer = _select_with_back(
+                "Select provider:", choices, default=default_choice
+            )
 
             if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
                 break
@@ -727,6 +847,7 @@ def _configure_providers(config: Config) -> None:
             # Find the actual provider key from display names
             for name, display in _get_provider_names().items():
                 if display == provider_name:
+                    last_provider_key = name
                     _configure_provider(config, name)
                     break
 
@@ -755,7 +876,7 @@ def _get_channel_info() -> dict[str, tuple[str, type[BaseModel]]]:
                 display_name = getattr(channel_cls, "display_name", name.capitalize())
                 result[name] = (display_name, config_cls)
         except Exception:
-            logger.warning(f"Failed to load channel module: {name}")
+            logger.warning("Failed to load channel module: {}", name)
     return result
 
 
@@ -800,17 +921,21 @@ def _configure_channels(config: Config) -> None:
     channel_names = list(_get_channel_names().keys())
     choices = channel_names + ["<- Back"]
 
+    last_choice: str | None = None
     while True:
         try:
             console.clear()
             _show_section_header("Chat Channels", "Select a channel to configure connection settings")
-            answer = _select_with_back("Select channel:", choices)
+            answer = _select_with_back(
+                "Select channel:", choices, default=last_choice
+            )
 
             if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
                 break
 
             # Type guard: answer is now guaranteed to be a string
             assert isinstance(answer, str)
+            last_choice = answer
             _configure_channel(config, answer)
         except KeyboardInterrupt:
             console.print("\n[dim]Returning to main menu...[/dim]")
@@ -821,18 +946,24 @@ def _configure_channels(config: Config) -> None:
 
 _SETTINGS_SECTIONS: dict[str, tuple[str, str, set[str] | None]] = {
     "Agent Settings": ("Agent Defaults", "Configure default model, temperature, and behavior", None),
+    "Channel Common": ("Channel Common", "Configure cross-channel behavior: progress, tool hints, retries", None),
+    "API Server": ("API Server", "Configure OpenAI-compatible API endpoint", None),
     "Gateway": ("Gateway Settings", "Configure server host, port, and heartbeat", None),
     "Tools": ("Tools Settings", "Configure web search, shell exec, and other tools", {"mcp_servers"}),
 }
 
 _SETTINGS_GETTER = {
     "Agent Settings": lambda c: c.agents.defaults,
+    "Channel Common": lambda c: c.channels,
+    "API Server": lambda c: c.api,
     "Gateway": lambda c: c.gateway,
     "Tools": lambda c: c.tools,
 }
 
 _SETTINGS_SETTER = {
     "Agent Settings": lambda c, v: setattr(c.agents, "defaults", v),
+    "Channel Common": lambda c, v: setattr(c, "channels", v),
+    "API Server": lambda c, v: setattr(c, "api", v),
     "Gateway": lambda c, v: setattr(c, "gateway", v),
     "Tools": lambda c, v: setattr(c, "tools", v),
 }
@@ -915,11 +1046,19 @@ def _show_summary(config: Config) -> None:
     # Settings sections
     for title, model in [
         ("Agent Settings", config.agents.defaults),
+        ("Channel Common", config.channels),
+        ("API Server", config.api),
         ("Gateway", config.gateway),
         ("Tools", config.tools),
-        ("Channel Common", config.channels),
     ]:
         _print_summary_panel(_summarize_model(model), title)
+
+    _pause()
+
+
+def _pause() -> None:
+    """Pause for user acknowledgement before clearing the screen."""
+    _get_questionary().text("Press Enter to continue...", default="").ask()
 
 
 # --- Main Entry Point ---
@@ -974,6 +1113,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
     original_config = base_config.model_copy(deep=True)
     config = base_config.model_copy(deep=True)
 
+    last_main_choice: str | None = None
     while True:
         console.clear()
         _show_main_menu_header()
@@ -984,13 +1124,16 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
                 choices=[
                     "[P] LLM Provider",
                     "[C] Chat Channel",
+                    "[H] Channel Common",
                     "[A] Agent Settings",
+                    "[I] API Server",
                     "[G] Gateway",
                     "[T] Tools",
                     "[V] View Configuration Summary",
                     "[S] Save and Exit",
                     "[X] Exit Without Saving",
                 ],
+                default=last_main_choice,
                 qmark=">",
             ).ask()
         except KeyboardInterrupt:
@@ -1004,10 +1147,12 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
                 return OnboardResult(config=original_config, should_save=False)
             continue
 
-        _MENU_DISPATCH = {
+        _menu_dispatch = {
             "[P] LLM Provider": lambda: _configure_providers(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
+            "[H] Channel Common": lambda: _configure_general_settings(config, "Channel Common"),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
+            "[I] API Server": lambda: _configure_general_settings(config, "API Server"),
             "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),
             "[T] Tools": lambda: _configure_general_settings(config, "Tools"),
             "[V] View Configuration Summary": lambda: _show_summary(config),
@@ -1018,6 +1163,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
         if answer == "[X] Exit Without Saving":
             return OnboardResult(config=original_config, should_save=False)
 
-        action_fn = _MENU_DISPATCH.get(answer)
+        action_fn = _menu_dispatch.get(answer)
         if action_fn:
+            last_main_choice = answer
             action_fn()
