@@ -1570,6 +1570,102 @@ async def test_group_allow_from_does_not_affect_private_chats() -> None:
     assert len(handled) == 1
 
 
+@pytest.mark.asyncio
+async def test_group_allow_from_does_not_block_mentions() -> None:
+    """@mentions in unlisted groups should still be accepted.
+
+    group_allow_from should only filter non-mentioned messages when policy is open.
+    Mentions should ALWAYS work, even from unlisted groups.
+    """
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="mention",
+            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # @mention from unlisted group should be accepted
+    mention = SimpleNamespace(type="mention", offset=0, length=13)
+    await channel._on_message(
+        _make_telegram_update(text="@nanobot_test hi", entities=[mention]),
+        None,
+    )
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_does_not_block_replies_to_bot() -> None:
+    """Replies to bot in unlisted groups should still be accepted."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="mention",
+            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Reply to bot from unlisted group should be accepted
+    reply = SimpleNamespace(from_user=SimpleNamespace(id=999))  # bot_id from _FakeBot.get_me()
+    await channel._on_message(
+        _make_telegram_update(text="reply to bot", reply_to_message=reply),
+        None,
+    )
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_filters_plain_messages_with_policy_open() -> None:
+    """Plain messages from unlisted groups should be rejected when policy is open."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Plain message from unlisted group should NOT be accepted
+    await channel._on_message(_make_telegram_update(text="hello"), None)
+
+    assert handled == []
+
+
 # ---------------------------------------------------------------------------
 # Tests for retry amplification fix (issue #3050)
 # ---------------------------------------------------------------------------
