@@ -9,6 +9,7 @@ import time
 import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,7 +36,6 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
-TELEGRAM_GROUPS_FILE = Path.home() / ".nanobot" / "telegram_groups.json"
 # Telegram's actual API limit is 4096; we split raw markdown at 4000 as a
 # safety margin for mid-stream edits (plain text).  For _stream_end, we
 # convert to HTML first and then split at the true 4096-char boundary so
@@ -216,23 +216,105 @@ def _markdown_to_telegram_html(text: str) -> str:
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
+_SEEN_GROUP_PRUNE_DAYS = 30  # prune seen groups older than this
+
+
+def _get_groups_file() -> Path:
+    """Return the path to telegram_groups.json."""
+    return Path.home() / ".nanobot" / "telegram_groups.json"
+
+
+def _load_groups_data() -> dict[str, Any]:
+    """Load telegram groups data from JSON file."""
+    path = _get_groups_file()
+    if not path.exists():
+        return {"allowed": [], "seen": []}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"allowed": [], "seen": []}
+
+
+def _save_groups_data(data: dict[str, Any]) -> None:
+    """Save telegram groups data to JSON file."""
+    path = _get_groups_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _prune_old_seen_groups(data: dict[str, Any]) -> bool:
+    """Remove seen groups older than _SEEN_GROUP_PRUNE_DAYS. Returns True if pruned."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_SEEN_GROUP_PRUNE_DAYS)
+    original_count = len(data.get("seen", []))
+    pruned = []
+    for entry in data.get("seen", []):
+        try:
+            last_seen = datetime.fromisoformat(entry.get("last_seen", ""))
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            if last_seen >= cutoff:
+                pruned.append(entry)
+        except (ValueError, TypeError):
+            pass
+    data["seen"] = pruned
+    return len(pruned) < original_count
+
+
+def _format_relative_time(iso_str: str) -> str:
+    """Format an ISO timestamp as relative time (e.g., '2h ago')."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        if delta.days > 0:
+            return f"{delta.days}d ago"
+        hours = delta.seconds // 3600
+        if hours > 0:
+            return f"{hours}h ago"
+        minutes = delta.seconds // 60
+        if minutes > 0:
+            return f"{minutes}m ago"
+        return "just now"
+    except (ValueError, TypeError):
+        return "unknown"
 
 
 def _load_persisted_groups() -> list[str]:
     """Load persisted group IDs from the JSON file."""
-    if not TELEGRAM_GROUPS_FILE.exists():
+    path = _get_groups_file()
+    if not path.exists():
         return []
     try:
-        data = json.loads(TELEGRAM_GROUPS_FILE.read_text())
-        return list(data.get("allowed", []))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        allowed = data.get("allowed", [])
+        # Handle both string format and dict format for backward compatibility
+        return [str(g) if isinstance(g, str) else str(g.get("id", "")) for g in allowed]
     except (json.JSONDecodeError, OSError):
         return []
 
 
 def _save_persisted_groups(groups: list[str]) -> None:
-    """Save group IDs to the JSON file."""
-    TELEGRAM_GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TELEGRAM_GROUPS_FILE.write_text(json.dumps({"allowed": groups}, indent=2))
+    """Save group IDs to the JSON file.
+
+    Preserves the 'seen' section if present, only updates 'allowed'.
+    """
+    path = _get_groups_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Load existing data to preserve 'seen' section
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    existing["allowed"] = groups
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _parse_group_id(text: str) -> str | None:
@@ -297,7 +379,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
         BotCommand("addgroup", "Add group to allowlist (admin only)"),
         BotCommand("removegroup", "Remove group from allowlist (admin only)"),
-        BotCommand("groups", "List allowed groups (admin only)"),
+        BotCommand("groups", "List allowed and seen groups (admin only)"),
         BotCommand("help", "Show available commands"),
     ]
 
@@ -355,6 +437,40 @@ class TelegramChannel(BaseChannel):
             return sid in admin_list or username in admin_list
 
         return False
+
+    def _track_seen_group(self, chat_id: int, chat_title: str | None) -> None:
+        """Track a group chat as seen for the /groups command."""
+        data = _load_groups_data()
+        _prune_old_seen_groups(data)
+
+        chat_id_str = str(chat_id)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Handle both string format and dict format for allowed groups
+        allowed = data.get("allowed", [])
+        allowed_ids = {
+            str(g) if isinstance(g, str) else str(g.get("id", ""))
+            for g in allowed
+        }
+        if chat_id_str in allowed_ids:
+            return
+
+        seen_list = data.get("seen", [])
+        for entry in seen_list:
+            if str(entry.get("id")) == chat_id_str:
+                entry["last_seen"] = now_iso
+                if chat_title:
+                    entry["name"] = chat_title
+                _save_groups_data(data)
+                return
+
+        seen_list.append({
+            "id": chat_id_str,
+            "name": chat_title or "Unknown",
+            "last_seen": now_iso,
+        })
+        data["seen"] = seen_list
+        _save_groups_data(data)
 
     @staticmethod
     def _normalize_telegram_command(content: str) -> str:
@@ -427,6 +543,7 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/groups(?:@\w+)?$"), self._on_groups))
 
         # Admin-only group management commands
         self._app.add_handler(
@@ -434,9 +551,6 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(
             MessageHandler(filters.Regex(r"^/removegroup(?:@\w+)?(?:\s+.*)?$"), self._on_removegroup)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.Regex(r"^/groups(?:@\w+)?$"), self._on_groups)
         )
 
         # Add message handler for text, photos, video, voice, documents, and locations
@@ -963,7 +1077,7 @@ class TelegramChannel(BaseChannel):
         self.logger.info("Admin {} removed group {} from allowlist", sender_id, group_id)
 
     async def _on_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /groups command to list allowed groups (admin only)."""
+        """Handle /groups command - list allowed and seen groups (admin only)."""
         if not update.message or not update.effective_user:
             return
         sender_id = self._sender_id(update.effective_user)
@@ -973,15 +1087,31 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("This command is admin-only.")
             return
 
-        if not self._runtime_groups:
-            await update.message.reply_text("No groups in the allowlist (all groups are allowed).")
-            return
+        data = _load_groups_data()
+        _prune_old_seen_groups(data)
 
         config_groups = set(self.config.group_allow_from or [])
-        lines = ["Allowed groups:"]
-        for gid in sorted(self._runtime_groups):
-            source = "config" if gid in config_groups else "persisted"
-            lines.append(f"  {gid} ({source})")
+        lines: list[str] = []
+
+        if self._runtime_groups:
+            lines.append("Allowed groups:")
+            for gid in sorted(self._runtime_groups):
+                source = "config" if gid in config_groups else "persisted"
+                lines.append(f"  {gid} ({source})")
+        else:
+            lines.append("Allowed groups: (none)")
+
+        seen = data.get("seen", [])
+        if seen:
+            lines.append("")
+            lines.append("Seen but not allowed:")
+            for g in seen:
+                gid = g.get("id", "?")
+                name = g.get("name", "Unknown")
+                last_seen = g.get("last_seen", "")
+                relative = _format_relative_time(last_seen) if last_seen else "unknown"
+                lines.append(f"  {gid} — {name} (seen {relative})")
+
         await update.message.reply_text("\n".join(lines))
 
     @staticmethod
@@ -1218,6 +1348,10 @@ class TelegramChannel(BaseChannel):
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
+
+        # Track seen groups for /groups command
+        if message.chat.type != "private":
+            self._track_seen_group(chat_id, getattr(message.chat, "title", None))
 
         if not await self._is_group_message_for_bot(message):
             return
