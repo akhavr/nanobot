@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 import unicodedata
@@ -34,6 +35,7 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_GROUPS_FILE = Path.home() / ".nanobot" / "telegram_groups.json"
 # Telegram's actual API limit is 4096; we split raw markdown at 4000 as a
 # safety margin for mid-stream edits (plain text).  For _stream_end, we
 # convert to HTML first and then split at the true 4096-char boundary so
@@ -216,6 +218,33 @@ _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
 
 
+def _load_persisted_groups() -> list[str]:
+    """Load persisted group IDs from the JSON file."""
+    if not TELEGRAM_GROUPS_FILE.exists():
+        return []
+    try:
+        data = json.loads(TELEGRAM_GROUPS_FILE.read_text())
+        return list(data.get("allowed", []))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_persisted_groups(groups: list[str]) -> None:
+    """Save group IDs to the JSON file."""
+    TELEGRAM_GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TELEGRAM_GROUPS_FILE.write_text(json.dumps({"allowed": groups}, indent=2))
+
+
+def _parse_group_id(text: str) -> str | None:
+    """Extract and validate a group ID from user input. Returns normalized ID or None."""
+    text = text.strip()
+    if not text:
+        return None
+    if text.lstrip("-").isdigit():
+        return text
+    return None
+
+
 @dataclass
 class _StreamBuf:
     """Per-chat streaming accumulator for progressive message editing."""
@@ -266,6 +295,9 @@ class TelegramChannel(BaseChannel):
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("addgroup", "Add group to allowlist (admin only)"),
+        BotCommand("removegroup", "Remove group from allowlist (admin only)"),
+        BotCommand("groups", "List allowed groups (admin only)"),
         BotCommand("help", "Show available commands"),
     ]
 
@@ -287,6 +319,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._runtime_groups: set[str] = set(self.config.group_allow_from or [])
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -334,12 +367,23 @@ class TelegramChannel(BaseChannel):
             return content.replace("/dream_restore", "/dream-restore", 1)
         return content
 
+    def _load_and_merge_groups(self) -> None:
+        """Load persisted groups and merge with config at runtime."""
+        persisted = _load_persisted_groups()
+        config_groups = self.config.group_allow_from or []
+        self._runtime_groups = set(config_groups) | set(persisted)
+
+    def _get_effective_groups(self) -> list[str]:
+        """Return effective group allowlist (config + persisted, deduplicated)."""
+        return sorted(self._runtime_groups)
+
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
             self.logger.error("bot token not configured")
             return
 
+        self._load_and_merge_groups()
         self._running = True
 
         proxy = self.config.proxy or None
@@ -383,6 +427,17 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+
+        # Admin-only group management commands
+        self._app.add_handler(
+            MessageHandler(filters.Regex(r"^/addgroup(?:@\w+)?(?:\s+.*)?$"), self._on_addgroup)
+        )
+        self._app.add_handler(
+            MessageHandler(filters.Regex(r"^/removegroup(?:@\w+)?(?:\s+.*)?$"), self._on_removegroup)
+        )
+        self._app.add_handler(
+            MessageHandler(filters.Regex(r"^/groups(?:@\w+)?$"), self._on_groups)
+        )
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(
@@ -823,6 +878,112 @@ class TelegramChannel(BaseChannel):
             return
         await update.message.reply_text(build_help_text())
 
+    async def _on_addgroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /addgroup command to add a group to the allowlist (admin only)."""
+        if not update.message or not update.effective_user:
+            return
+        sender_id = self._sender_id(update.effective_user)
+        if not self.is_allowed(sender_id):
+            return
+        if not self.is_admin(sender_id):
+            await update.message.reply_text("This command is admin-only.")
+            return
+
+        text = update.message.text or ""
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if "@" in arg.split()[0] if arg else False:
+            arg = " ".join(arg.split()[1:]) if len(arg.split()) > 1 else ""
+
+        group_id = _parse_group_id(arg)
+        if not group_id:
+            await update.message.reply_text(
+                "Usage: /addgroup <group_id>\n"
+                "Example: /addgroup -100123456789"
+            )
+            return
+
+        if group_id in self._runtime_groups:
+            await update.message.reply_text(f"Group {group_id} is already in the allowlist.")
+            return
+
+        persisted = _load_persisted_groups()
+        if group_id not in persisted:
+            persisted.append(group_id)
+            _save_persisted_groups(persisted)
+
+        self._runtime_groups.add(group_id)
+        await update.message.reply_text(f"Added group {group_id} to the allowlist.")
+        self.logger.info("Admin {} added group {} to allowlist", sender_id, group_id)
+
+    async def _on_removegroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /removegroup command to remove a group from the allowlist (admin only)."""
+        if not update.message or not update.effective_user:
+            return
+        sender_id = self._sender_id(update.effective_user)
+        if not self.is_allowed(sender_id):
+            return
+        if not self.is_admin(sender_id):
+            await update.message.reply_text("This command is admin-only.")
+            return
+
+        text = update.message.text or ""
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if "@" in arg.split()[0] if arg else False:
+            arg = " ".join(arg.split()[1:]) if len(arg.split()) > 1 else ""
+
+        group_id = _parse_group_id(arg)
+        if not group_id:
+            await update.message.reply_text(
+                "Usage: /removegroup <group_id>\n"
+                "Example: /removegroup -100123456789"
+            )
+            return
+
+        config_groups = set(self.config.group_allow_from or [])
+        if group_id in config_groups:
+            await update.message.reply_text(
+                f"Group {group_id} is defined in config and cannot be removed dynamically.\n"
+                "Edit the config file to remove it."
+            )
+            return
+
+        if group_id not in self._runtime_groups:
+            await update.message.reply_text(f"Group {group_id} is not in the allowlist.")
+            return
+
+        persisted = _load_persisted_groups()
+        if group_id in persisted:
+            persisted.remove(group_id)
+            _save_persisted_groups(persisted)
+
+        self._runtime_groups.discard(group_id)
+        await update.message.reply_text(f"Removed group {group_id} from the allowlist.")
+        self.logger.info("Admin {} removed group {} from allowlist", sender_id, group_id)
+
+    async def _on_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /groups command to list allowed groups (admin only)."""
+        if not update.message or not update.effective_user:
+            return
+        sender_id = self._sender_id(update.effective_user)
+        if not self.is_allowed(sender_id):
+            return
+        if not self.is_admin(sender_id):
+            await update.message.reply_text("This command is admin-only.")
+            return
+
+        if not self._runtime_groups:
+            await update.message.reply_text("No groups in the allowlist (all groups are allowed).")
+            return
+
+        config_groups = set(self.config.group_allow_from or [])
+        lines = ["Allowed groups:"]
+        for gid in sorted(self._runtime_groups):
+            source = "config" if gid in config_groups else "persisted"
+            lines.append(f"  {gid} ({source})")
+        await update.message.reply_text("\n".join(lines))
+
     @staticmethod
     def _sender_id(user) -> str:
         """Build sender_id with username for allowlist matching."""
@@ -972,8 +1133,7 @@ class TelegramChannel(BaseChannel):
         if message.chat.type == "private":
             return True
 
-        group_allow = self.config.group_allow_from
-        in_allowed_group = not group_allow or str(message.chat_id) in group_allow
+        in_allowed_group = not self._runtime_groups or str(message.chat_id) in self._runtime_groups
 
         # Fast path: policy is open and group is allowed (no need to check mentions)
         if self.config.group_policy == "open" and in_allowed_group:
