@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
-    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
+    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md, etc."""
 
     _DEFAULT_MAX_HISTORY = 1000
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
@@ -57,12 +57,16 @@ class MemoryStore:
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
+        self.user_private_file = workspace / "USER_PRIVATE.md"
+        self.shared_file = workspace / "SHARED.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self._session_dream_cursors_file = self.memory_dir / ".session_dream_cursors"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+            "SOUL.md", "USER.md", "USER_PRIVATE.md", "SHARED.md",
+            "memory/MEMORY.md", "memory/.dream_cursor",
         ])
         self._maybe_migrate_legacy_history()
 
@@ -223,6 +227,22 @@ class MemoryStore:
 
     def write_user(self, content: str) -> None:
         self.user_file.write_text(content, encoding="utf-8")
+
+    # -- USER_PRIVATE.md -----------------------------------------------------
+
+    def read_user_private(self) -> str:
+        return self.read_file(self.user_private_file)
+
+    def write_user_private(self, content: str) -> None:
+        self.user_private_file.write_text(content, encoding="utf-8")
+
+    # -- SHARED.md -----------------------------------------------------------
+
+    def read_shared(self) -> str:
+        return self.read_file(self.shared_file)
+
+    def write_shared(self, content: str) -> None:
+        self.shared_file.write_text(content, encoding="utf-8")
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -399,6 +419,35 @@ class MemoryStore:
 
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+
+    # -- session dream cursors (per-session tracking for group extraction) ---
+
+    def _load_session_dream_cursors(self) -> dict[str, int]:
+        """Load per-session dream cursors from JSON file."""
+        if not self._session_dream_cursors_file.exists():
+            return {}
+        try:
+            data = json.loads(self._session_dream_cursors_file.read_text(encoding="utf-8"))
+            return {k: int(v) for k, v in data.items() if isinstance(v, (int, str))}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_session_dream_cursors(self, cursors: dict[str, int]) -> None:
+        """Save per-session dream cursors to JSON file."""
+        self._session_dream_cursors_file.write_text(
+            json.dumps(cursors, indent=2), encoding="utf-8"
+        )
+
+    def get_session_dream_cursor(self, session_key: str) -> int:
+        """Get the last processed message index for a session."""
+        cursors = self._load_session_dream_cursors()
+        return cursors.get(session_key, 0)
+
+    def set_session_dream_cursor(self, session_key: str, cursor: int) -> None:
+        """Set the last processed message index for a session."""
+        cursors = self._load_session_dream_cursors()
+        cursors[session_key] = cursor
+        self._save_session_dream_cursors(cursors)
 
     # -- message formatting utility ------------------------------------------
 
@@ -787,6 +836,9 @@ class Dream:
     Phase 1 produces an analysis summary (plain LLM call).
     Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
     LLM can make targeted, incremental edits instead of replacing entire files.
+
+    Also processes group chat sessions (member_count >= 3), extracting facts
+    only to SHARED.md to maintain privacy boundaries.
     """
 
     # Caps on prompt-bound inputs so Dream's LLM calls never exceed the model's
@@ -796,7 +848,18 @@ class Dream:
     _MEMORY_FILE_MAX_CHARS = 32_000
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
+    _SHARED_FILE_MAX_CHARS = 16_000
     _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
+    _SESSION_MESSAGE_PREVIEW_MAX_CHARS = 2_000
+
+    # Patterns that indicate a group session key
+    # - Telegram groups have negative chat IDs: telegram:-1234567890
+    # - Topic threads: telegram:-1234567890:topic:123
+    # - Matrix rooms with multiple members typically have room IDs starting with !
+    _GROUP_SESSION_KEY_PATTERNS = [
+        re.compile(r"^telegram:-\d+"),  # Telegram group (negative ID)
+        re.compile(r":topic:\d+$"),      # Telegram topic thread
+    ]
 
     def __init__(
         self,
@@ -807,6 +870,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        sessions: SessionManager | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -818,6 +882,7 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.sessions = sessions
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1084,3 +1149,229 @@ class Dream:
                 logger.info("Dream commit: {}", sha)
 
         return True
+
+    # -- group session processing --------------------------------------------
+
+    def is_group_session(self, session_key: str, metadata: dict[str, Any] | None = None) -> bool:
+        """Determine if a session is a group chat (member_count >= 3).
+
+        Detection uses two strategies:
+        1. Session metadata with member_count >= 3
+        2. Session key patterns (e.g., negative Telegram IDs, topic threads)
+
+        Returns True for group sessions, False for DMs/1:1 chats.
+        """
+        # Strategy 1: Check metadata for member_count
+        if metadata:
+            member_count = metadata.get("member_count")
+            if isinstance(member_count, int) and member_count >= 3:
+                return True
+
+        # Strategy 2: Check session key patterns
+        for pattern in self._GROUP_SESSION_KEY_PATTERNS:
+            if pattern.search(session_key):
+                return True
+
+        return False
+
+    def _format_session_messages(self, messages: list[dict[str, Any]]) -> str:
+        """Format session messages for LLM prompt."""
+        lines = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if not content:
+                continue
+            if isinstance(content, list):
+                # Extract text from content blocks
+                content = " ".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            content = truncate_text(content, self._SESSION_MESSAGE_PREVIEW_MAX_CHARS)
+            role = msg.get("role", "unknown").upper()
+            timestamp = msg.get("timestamp", "?")[:16]
+            lines.append(f"[{timestamp}] {role}: {content}")
+        return "\n".join(lines)
+
+    async def run_session(self, session_key: str) -> bool:
+        """Process a single group session, extracting facts to SHARED.md only.
+
+        Returns True if work was done, False otherwise.
+        """
+        if not self.sessions:
+            logger.warning("Dream.run_session called but no SessionManager configured")
+            return False
+
+        # Load session data
+        session_data = self.sessions.read_session_file(session_key)
+        if not session_data:
+            return False
+
+        metadata = session_data.get("metadata", {})
+        messages = session_data.get("messages", [])
+
+        # Verify this is a group session
+        if not self.is_group_session(session_key, metadata):
+            logger.debug("Session {} is not a group session, skipping", session_key)
+            return False
+
+        # Get cursor for this session
+        last_cursor = self.store.get_session_dream_cursor(session_key)
+
+        # Get unprocessed messages (messages after the cursor index)
+        unprocessed = messages[last_cursor:]
+        if not unprocessed:
+            return False
+
+        batch = unprocessed[: self.max_batch_size]
+        logger.info(
+            "Dream group session {}: processing {} messages (cursor {}→{})",
+            session_key, len(batch), last_cursor, last_cursor + len(batch),
+        )
+
+        # Build conversation text
+        history_text = self._format_session_messages(batch)
+        if not history_text.strip():
+            # No meaningful content to process
+            self.store.set_session_dream_cursor(session_key, last_cursor + len(batch))
+            return False
+
+        # Current SHARED.md content
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_shared = truncate_text(
+            self.store.read_shared() or "(empty)", self._SHARED_FILE_MAX_CHARS,
+        )
+
+        file_context = (
+            f"## Current Date\n{current_date}\n\n"
+            f"## Session Key\n{session_key}\n\n"
+            f"## Current SHARED.md ({len(current_shared)} chars)\n{current_shared}"
+        )
+
+        # Phase 1: Analyze for SHARED.md extraction only
+        phase1_prompt = f"## Group Conversation\n{history_text}\n\n{file_context}"
+
+        try:
+            phase1_response = await self.provider.chat_with_retry(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": render_template(
+                            "agent/dream_group_phase1.md",
+                            strip=True,
+                        ),
+                    },
+                    {"role": "user", "content": phase1_prompt},
+                ],
+                tools=None,
+                tool_choice=None,
+            )
+            analysis = phase1_response.content or ""
+            logger.debug(
+                "Dream group Phase 1 analysis for {} ({} chars): {}",
+                session_key, len(analysis), analysis[:300],
+            )
+        except Exception:
+            logger.exception("Dream group Phase 1 failed for {}", session_key)
+            return False
+
+        # If no facts to extract, just advance the cursor
+        if "[SKIP]" in analysis or not analysis.strip():
+            self.store.set_session_dream_cursor(session_key, last_cursor + len(batch))
+            logger.debug("Dream group session {}: nothing to extract", session_key)
+            return True
+
+        # Phase 2: Edit SHARED.md only
+        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}"
+
+        tools = self._tools
+        messages_list: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": render_template(
+                    "agent/dream_group_phase2.md",
+                    strip=True,
+                ),
+            },
+            {"role": "user", "content": phase2_prompt},
+        ]
+
+        try:
+            result = await self._runner.run(AgentRunSpec(
+                initial_messages=messages_list,
+                tools=tools,
+                model=self.model,
+                max_iterations=self.max_iterations,
+                max_tool_result_chars=self.max_tool_result_chars,
+                fail_on_tool_error=False,
+            ))
+            logger.debug(
+                "Dream group Phase 2 for {}: stop_reason={}, tool_events={}",
+                session_key, result.stop_reason, len(result.tool_events),
+            )
+        except Exception:
+            logger.exception("Dream group Phase 2 failed for {}", session_key)
+            result = None
+
+        # Build changelog
+        changelog: list[str] = []
+        if result and result.tool_events:
+            for event in result.tool_events:
+                if event["status"] == "ok":
+                    changelog.append(f"{event['name']}: {event['detail']}")
+
+        # Advance cursor on success
+        if result and result.stop_reason == "completed":
+            new_cursor = last_cursor + len(batch)
+            self.store.set_session_dream_cursor(session_key, new_cursor)
+            logger.info(
+                "Dream group session {} done: {} change(s), cursor → {}",
+                session_key, len(changelog), new_cursor,
+            )
+        else:
+            reason = result.stop_reason if result else "exception"
+            logger.warning(
+                "Dream group session {} incomplete ({}): cursor NOT advanced",
+                session_key, reason,
+            )
+
+        # Git auto-commit for group extractions
+        if changelog and self.store.git.is_initialized():
+            summary = f"dream-group: {session_key}, {len(changelog)} change(s)"
+            commit_msg = f"{summary}\n\n{analysis.strip()}"
+            sha = self.store.git.auto_commit(commit_msg)
+            if sha:
+                logger.info("Dream group commit: {}", sha)
+
+        return True
+
+    async def run_sessions(self) -> int:
+        """Process all group chat sessions. Returns count of sessions processed."""
+        if not self.sessions:
+            logger.debug("Dream.run_sessions: no SessionManager configured")
+            return 0
+
+        sessions_dir = self.store.workspace / "sessions"
+        if not sessions_dir.exists():
+            return 0
+
+        processed = 0
+        for session_file in sessions_dir.glob("*.jsonl"):
+            # Derive session key from filename
+            session_key = session_file.stem.replace("_", ":", 1)
+
+            # Quick check if this looks like a group session by key pattern
+            is_likely_group = any(
+                p.search(session_key) for p in self._GROUP_SESSION_KEY_PATTERNS
+            )
+            if not is_likely_group:
+                continue
+
+            try:
+                if await self.run_session(session_key):
+                    processed += 1
+            except Exception:
+                logger.exception("Dream failed for group session {}", session_key)
+
+        return processed

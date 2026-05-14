@@ -418,7 +418,6 @@ class TestAutoCompactIdleDetection:
         assert len(session_after.messages) == 0
         await loop.close_mcp()
 
-
 class TestAutoCompactSystemMessages:
     """Test that auto-new also works for system messages."""
 

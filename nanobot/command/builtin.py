@@ -293,9 +293,15 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
         t0 = time.monotonic()
         try:
             did_work = await loop.dream.run()
+            sessions_processed = await loop.dream.run_sessions()
             elapsed = time.monotonic() - t0
-            if did_work:
-                content = f"Dream completed in {elapsed:.1f}s."
+            if did_work or sessions_processed:
+                parts = []
+                if did_work:
+                    parts.append("history processed")
+                if sessions_processed:
+                    parts.append(f"{sessions_processed} group session(s)")
+                content = f"Dream completed in {elapsed:.1f}s: {', '.join(parts)}."
             else:
                 content = "Dream: nothing to process."
         except Exception as e:
