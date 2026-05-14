@@ -764,7 +764,8 @@ def _run_gateway(
         if job.name == "dream":
             try:
                 await agent.dream.run()
-                logger.info("Dream cron job completed")
+                sessions_processed = await agent.dream.run_sessions()
+                logger.info("Dream cron job completed (sessions_processed={})", sessions_processed)
             except Exception:
                 logger.exception("Dream cron job failed")
             return None

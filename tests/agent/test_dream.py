@@ -422,3 +422,283 @@ class TestDreamUserMdStructure:
         assert "Family table" in system_msg
         assert "Name | Relation | Birthday | Notes" in system_msg
 
+
+class TestDreamGroupSessionDetection:
+    """Tests for group session detection logic."""
+
+    def test_dm_session_not_detected_as_group(self, store, mock_provider):
+        """DM sessions (positive Telegram IDs) should not be detected as groups."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        # Positive Telegram ID = DM
+        assert dream.is_group_session("telegram:123456789") is False
+        assert dream.is_group_session("telegram:987654321") is False
+
+    def test_group_session_detected_by_negative_id(self, store, mock_provider):
+        """Telegram groups (negative IDs) should be detected as groups."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        # Negative Telegram ID = group
+        assert dream.is_group_session("telegram:-1001234567890") is True
+        assert dream.is_group_session("telegram:-987654321") is True
+
+    def test_topic_session_detected_as_group(self, store, mock_provider):
+        """Telegram topic threads should be detected as groups."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        # Topic threads are always in groups
+        assert dream.is_group_session("telegram:-1001234567890:topic:123") is True
+        assert dream.is_group_session("telegram:123456789:topic:456") is True
+
+    def test_member_count_metadata_overrides_pattern(self, store, mock_provider):
+        """member_count >= 3 in metadata should mark as group regardless of key."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        # Even a DM-looking key with member_count >= 3 is a group
+        assert dream.is_group_session("telegram:123456789", {"member_count": 3}) is True
+        assert dream.is_group_session("telegram:123456789", {"member_count": 10}) is True
+
+        # member_count <= 2 does not make a group key non-group
+        # (pattern still matches)
+        assert dream.is_group_session("telegram:-1001234567890", {"member_count": 2}) is True
+
+    def test_dm_with_low_member_count_not_group(self, store, mock_provider):
+        """DM key with member_count <= 2 is not a group."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        assert dream.is_group_session("telegram:123456789", {"member_count": 1}) is False
+        assert dream.is_group_session("telegram:123456789", {"member_count": 2}) is False
+
+    def test_other_channels_not_detected_as_group_by_default(self, store, mock_provider):
+        """Non-Telegram channels without group patterns are not groups by default."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        assert dream.is_group_session("discord:channel123") is False
+        assert dream.is_group_session("slack:workspace:channel") is False
+        assert dream.is_group_session("matrix:!roomid:server") is False
+
+
+class TestDreamGroupSessionProcessing:
+    """Tests for group session extraction to SHARED.md only."""
+
+    @pytest.fixture
+    def sessions_manager(self, tmp_path):
+        """Create a SessionManager with test sessions."""
+        from nanobot.session.manager import SessionManager
+        return SessionManager(tmp_path)
+
+    @pytest.fixture
+    def dream_with_sessions(self, store, mock_provider, mock_runner, sessions_manager):
+        """Dream instance with SessionManager for group processing."""
+        d = Dream(
+            store=store,
+            provider=mock_provider,
+            model="test-model",
+            max_batch_size=5,
+            sessions=sessions_manager,
+        )
+        d._runner = mock_runner
+        return d
+
+    def _create_group_session(self, sessions_manager, session_key: str, messages: list[dict]):
+        """Helper to create a test group session."""
+        from nanobot.session.manager import Session
+        session = sessions_manager.get_or_create(session_key)
+        session.messages = messages
+        session.metadata["member_count"] = 5  # Mark as group
+        sessions_manager.save(session)
+        return session
+
+    async def test_group_session_extracts_to_shared_only(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
+    ):
+        """Group session extraction should only touch SHARED.md."""
+        # Create a group session with messages
+        session_key = "telegram:-1001234567890"
+        self._create_group_session(sessions_manager, session_key, [
+            {"role": "user", "content": "My daughter Emma's birthday is October 1st", "timestamp": "2026-01-15T10:00:00"},
+            {"role": "assistant", "content": "I'll remember that!", "timestamp": "2026-01-15T10:00:05"},
+        ])
+
+        # Setup mocks
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[SHARED] Emma (daughter) birthday: October 1"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "SHARED.md"}],
+        ))
+
+        # Run session extraction
+        result = await dream_with_sessions.run_session(session_key)
+
+        assert result is True
+        mock_provider.chat_with_retry.assert_called_once()
+
+        # Verify Phase 1 uses group-specific prompt
+        call_args = mock_provider.chat_with_retry.call_args
+        system_msg = call_args.kwargs["messages"][0]["content"]
+        assert "GROUP CONVERSATION" in system_msg or "SHARED.md" in system_msg
+
+    async def test_group_session_skips_dm_sessions(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager,
+    ):
+        """DM sessions should be skipped by run_session."""
+        # Create a DM session (positive ID)
+        session_key = "telegram:123456789"
+        self._create_group_session(sessions_manager, session_key, [
+            {"role": "user", "content": "My secret plan", "timestamp": "2026-01-15T10:00:00"},
+        ])
+        # Override to make it a DM
+        session = sessions_manager.get_or_create(session_key)
+        session.metadata["member_count"] = 2
+        sessions_manager.save(session)
+
+        result = await dream_with_sessions.run_session(session_key)
+
+        assert result is False
+        mock_provider.chat_with_retry.assert_not_called()
+
+    async def test_group_session_advances_cursor(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
+    ):
+        """Group session processing should advance per-session cursor."""
+        session_key = "telegram:-1001234567890"
+        self._create_group_session(sessions_manager, session_key, [
+            {"role": "user", "content": "message 1", "timestamp": "2026-01-15T10:00:00"},
+            {"role": "user", "content": "message 2", "timestamp": "2026-01-15T10:00:05"},
+        ])
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream_with_sessions.run_session(session_key)
+
+        cursor = store.get_session_dream_cursor(session_key)
+        assert cursor == 2
+
+    async def test_run_sessions_processes_only_groups(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
+    ):
+        """run_sessions should only process group sessions, not DMs."""
+        # Create one group and one DM session
+        self._create_group_session(sessions_manager, "telegram:-1001234567890", [
+            {"role": "user", "content": "group message", "timestamp": "2026-01-15T10:00:00"},
+        ])
+
+        dm_session = sessions_manager.get_or_create("telegram:123456789")
+        dm_session.messages = [
+            {"role": "user", "content": "private message", "timestamp": "2026-01-15T10:00:00"},
+        ]
+        dm_session.metadata["member_count"] = 2
+        sessions_manager.save(dm_session)
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        count = await dream_with_sessions.run_sessions()
+
+        # Only the group session should be processed
+        assert count == 1
+
+    async def test_no_sessions_manager_returns_zero(self, store, mock_provider):
+        """run_sessions without SessionManager should return 0."""
+        dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+        count = await dream.run_sessions()
+
+        assert count == 0
+
+    async def test_retroactive_processing_of_existing_sessions(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
+    ):
+        """Existing group sessions (created before feature) should be processed retroactively."""
+        session_key = "telegram:-1001234567890"
+        # Simulate existing session with older messages
+        self._create_group_session(sessions_manager, session_key, [
+            {"role": "user", "content": "old msg 1", "timestamp": "2025-06-01T10:00:00"},
+            {"role": "user", "content": "old msg 2", "timestamp": "2025-06-02T10:00:00"},
+            {"role": "user", "content": "old msg 3", "timestamp": "2025-06-03T10:00:00"},
+        ])
+
+        # Cursor starts at 0 (no previous processing)
+        assert store.get_session_dream_cursor(session_key) == 0
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream_with_sessions.run_session(session_key)
+
+        # All 3 messages should be processed, cursor should advance
+        assert store.get_session_dream_cursor(session_key) == 3
+
+    async def test_phase2_prompt_restricts_to_shared_only(
+        self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
+    ):
+        """Phase 2 system prompt should explicitly restrict edits to SHARED.md."""
+        session_key = "telegram:-1001234567890"
+        self._create_group_session(sessions_manager, session_key, [
+            {"role": "user", "content": "family info", "timestamp": "2026-01-15T10:00:00"},
+        ])
+
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[SHARED] some family fact"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream_with_sessions.run_session(session_key)
+
+        # Check Phase 2 system prompt
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "SHARED.md" in system_msg
+        assert "NEVER" in system_msg or "ONLY" in system_msg
+
+
+class TestMemoryStoreSessionCursors:
+    """Tests for per-session dream cursor tracking."""
+
+    def test_get_session_cursor_default_zero(self, store):
+        """New session cursors should default to 0."""
+        cursor = store.get_session_dream_cursor("telegram:-1001234567890")
+        assert cursor == 0
+
+    def test_set_and_get_session_cursor(self, store):
+        """Session cursors should persist correctly."""
+        store.set_session_dream_cursor("telegram:-1001234567890", 5)
+        cursor = store.get_session_dream_cursor("telegram:-1001234567890")
+        assert cursor == 5
+
+    def test_multiple_session_cursors_independent(self, store):
+        """Different sessions should have independent cursors."""
+        store.set_session_dream_cursor("telegram:-1001111111111", 3)
+        store.set_session_dream_cursor("telegram:-1002222222222", 7)
+
+        assert store.get_session_dream_cursor("telegram:-1001111111111") == 3
+        assert store.get_session_dream_cursor("telegram:-1002222222222") == 7
+
+
+class TestMemoryStoreSharedFile:
+    """Tests for SHARED.md file operations."""
+
+    def test_read_shared_empty_default(self, store):
+        """read_shared should return empty string when file doesn't exist."""
+        content = store.read_shared()
+        assert content == ""
+
+    def test_write_and_read_shared(self, store):
+        """write_shared and read_shared should work correctly."""
+        store.write_shared("# Shared\n- Family birthdays")
+        content = store.read_shared()
+        assert "Family birthdays" in content
+
+    def test_read_user_private_empty_default(self, store):
+        """read_user_private should return empty string when file doesn't exist."""
+        content = store.read_user_private()
+        assert content == ""
+
+    def test_write_and_read_user_private(self, store):
+        """write_user_private and read_user_private should work correctly."""
+        store.write_user_private("# Private\n- Health info")
+        content = store.read_user_private()
+        assert "Health info" in content
+
