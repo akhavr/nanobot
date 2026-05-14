@@ -1155,19 +1155,19 @@ class Dream:
     def is_group_session(self, session_key: str, metadata: dict[str, Any] | None = None) -> bool:
         """Determine if a session is a group chat (member_count >= 3).
 
-        Detection uses two strategies:
-        1. Session metadata with member_count >= 3
-        2. Session key patterns (e.g., negative Telegram IDs, topic threads)
+        Detection strategy:
+        1. If metadata has explicit member_count (int), use it as authoritative
+        2. Otherwise fall back to session key patterns (e.g., negative Telegram IDs)
 
         Returns True for group sessions, False for DMs/1:1 chats.
         """
-        # Strategy 1: Check metadata for member_count
+        # Explicit member_count overrides pattern matching
         if metadata:
             member_count = metadata.get("member_count")
-            if isinstance(member_count, int) and member_count >= 3:
-                return True
+            if isinstance(member_count, int):
+                return member_count >= 3
 
-        # Strategy 2: Check session key patterns
+        # Fall back to pattern matching only when no member_count
         for pattern in self._GROUP_SESSION_KEY_PATTERNS:
             if pattern.search(session_key):
                 return True
