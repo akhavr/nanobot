@@ -1252,6 +1252,10 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         mark_webui_session(ctx.session, msg.metadata)
 
+        # Persist member_count to session metadata for Dream processing
+        if msg.metadata and "member_count" in msg.metadata:
+            ctx.session.metadata["member_count"] = msg.metadata["member_count"]
+
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):

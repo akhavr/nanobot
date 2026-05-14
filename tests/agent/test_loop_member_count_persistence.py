@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,8 +22,8 @@ def mock_provider():
 @pytest.fixture
 def agent_loop(tmp_path: Path, mock_provider):
     with patch("nanobot.agent.loop.ContextBuilder"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = MagicMock()
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
         loop = AgentLoop(
             bus=MessageBus(),
             provider=mock_provider,
@@ -33,7 +33,7 @@ def agent_loop(tmp_path: Path, mock_provider):
 
 
 @pytest.mark.asyncio
-async def test_state_build_persists_member_count_to_session_metadata(agent_loop):
+async def test_state_restore_persists_member_count_to_session_metadata(agent_loop):
     """Verify member_count from msg.metadata is persisted to session.metadata."""
     # Create a message with member_count in metadata
     msg = InboundMessage(
@@ -50,22 +50,19 @@ async def test_state_build_persists_member_count_to_session_metadata(agent_loop)
         msg=msg,
         session=session,
         session_key="telegram:-100123456",
-        state=TurnState.BUILD,
+        state=TurnState.RESTORE,
         turn_id="test-turn-1",
     )
 
-    # Mock consolidator to avoid actual consolidation
-    agent_loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
-
-    # Run the build state
-    await agent_loop._state_build(ctx)
+    # Run the restore state
+    await agent_loop._state_restore(ctx)
 
     # Verify member_count was persisted to session.metadata
     assert session.metadata.get("member_count") == 5
 
 
 @pytest.mark.asyncio
-async def test_state_build_persists_member_count_2_for_private_chat(agent_loop):
+async def test_state_restore_persists_member_count_2_for_private_chat(agent_loop):
     """Verify member_count=2 (1:1 with bot) is persisted correctly."""
     msg = InboundMessage(
         channel="telegram",
@@ -80,19 +77,18 @@ async def test_state_build_persists_member_count_2_for_private_chat(agent_loop):
         msg=msg,
         session=session,
         session_key="telegram:-100789",
-        state=TurnState.BUILD,
+        state=TurnState.RESTORE,
         turn_id="test-turn-2",
     )
 
-    agent_loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
-    await agent_loop._state_build(ctx)
+    await agent_loop._state_restore(ctx)
 
     # Verify member_count=2 is persisted (private chat with bot)
     assert session.metadata.get("member_count") == 2
 
 
 @pytest.mark.asyncio
-async def test_state_build_does_not_fail_without_member_count(agent_loop):
+async def test_state_restore_does_not_fail_without_member_count(agent_loop):
     """Verify processing works when member_count is not present."""
     msg = InboundMessage(
         channel="cli",
@@ -107,19 +103,18 @@ async def test_state_build_does_not_fail_without_member_count(agent_loop):
         msg=msg,
         session=session,
         session_key="cli:direct",
-        state=TurnState.BUILD,
+        state=TurnState.RESTORE,
         turn_id="test-turn-3",
     )
 
-    agent_loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
-    await agent_loop._state_build(ctx)
+    await agent_loop._state_restore(ctx)
 
     # Should not have member_count in metadata
     assert "member_count" not in session.metadata
 
 
 @pytest.mark.asyncio
-async def test_state_build_updates_member_count_when_changed(agent_loop):
+async def test_state_restore_updates_member_count_when_changed(agent_loop):
     """Verify member_count is updated when the count changes."""
     session = agent_loop.sessions.get_or_create("telegram:-100999")
     # Simulate previous member_count
@@ -138,12 +133,11 @@ async def test_state_build_updates_member_count_when_changed(agent_loop):
         msg=msg,
         session=session,
         session_key="telegram:-100999",
-        state=TurnState.BUILD,
+        state=TurnState.RESTORE,
         turn_id="test-turn-4",
     )
 
-    agent_loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
-    await agent_loop._state_build(ctx)
+    await agent_loop._state_restore(ctx)
 
     # Verify member_count was updated
     assert session.metadata.get("member_count") == 4
