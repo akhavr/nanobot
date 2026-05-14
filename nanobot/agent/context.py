@@ -21,7 +21,8 @@ from nanobot.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "SHARED.md", "TOOLS.md"]
+    PRIVATE_FILE = "USER_PRIVATE.md"  # Only loaded when member_count <= 2
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -38,11 +39,17 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
+        member_count: int | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        Args:
+            member_count: Number of members in the chat. When <= 2 (DM or 1:1 with bot),
+                          USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
+        """
         parts = [self._get_identity(channel=channel)]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(member_count=member_count)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -115,8 +122,13 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+    def _load_bootstrap_files(self, member_count: int | None = None) -> str:
+        """Load all bootstrap files from workspace.
+
+        Args:
+            member_count: Number of members in the chat. USER_PRIVATE.md is only
+                          loaded when member_count <= 2 (private/1:1 context).
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
@@ -124,6 +136,15 @@ class ContextBuilder:
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
+
+        # Load USER_PRIVATE.md only in private contexts (DM or 1:1 with bot)
+        # member_count None means unknown/CLI - default to private for safety
+        private_file = self.workspace / self.PRIVATE_FILE
+        if private_file.exists():
+            is_private_context = member_count is None or member_count <= 2
+            if is_private_context:
+                content = private_file.read_text(encoding="utf-8")
+                parts.append(f"## {self.PRIVATE_FILE}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
@@ -147,8 +168,14 @@ class ContextBuilder:
         current_role: str = "user",
         sender_id: str | None = None,
         session_summary: str | None = None,
+        member_count: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list for an LLM call.
+
+        Args:
+            member_count: Number of members in the chat. Controls whether
+                          USER_PRIVATE.md is included in context.
+        """
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, sender_id=sender_id)
         user_content = self._build_user_content(current_message, media)
 
@@ -159,7 +186,9 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
+            {"role": "system", "content": self.build_system_prompt(
+                skill_names, channel=channel, session_summary=session_summary, member_count=member_count
+            )},
             *history,
         ]
         if messages[-1].get("role") == current_role:

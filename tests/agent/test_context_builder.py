@@ -149,6 +149,100 @@ class TestLoadBootstrapFiles:
 
 
 # ---------------------------------------------------------------------------
+# Privacy Separation (USER_PRIVATE.md conditional loading)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivacySeparation:
+    """Tests for USER_PRIVATE.md conditional loading based on member_count."""
+
+    def test_private_file_loaded_when_member_count_is_none(self, tmp_path):
+        """When member_count is None (CLI/unknown), default to private context."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Solo trip to Cancun.", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files(member_count=None)
+        assert "## USER_PRIVATE.md" in result
+        assert "Solo trip to Cancun." in result
+
+    def test_private_file_loaded_when_member_count_is_1(self, tmp_path):
+        """DM context (user only, bot implicit) - private file loaded."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Personal finances.", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files(member_count=1)
+        assert "## USER_PRIVATE.md" in result
+        assert "Personal finances." in result
+
+    def test_private_file_loaded_when_member_count_is_2(self, tmp_path):
+        """1:1 group (user + bot) - private file loaded."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Health research.", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files(member_count=2)
+        assert "## USER_PRIVATE.md" in result
+        assert "Health research." in result
+
+    def test_private_file_not_loaded_when_member_count_is_3(self, tmp_path):
+        """Multi-user group (3 members) - private file NOT loaded."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Dating interests.", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files(member_count=3)
+        assert "## USER_PRIVATE.md" not in result
+        assert "Dating interests." not in result
+
+    def test_private_file_not_loaded_when_member_count_is_10(self, tmp_path):
+        """Large group - private file NOT loaded."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Budget details.", encoding="utf-8")
+        builder = _builder(tmp_path)
+        result = builder._load_bootstrap_files(member_count=10)
+        assert "## USER_PRIVATE.md" not in result
+        assert "Budget details." not in result
+
+    def test_shared_file_always_loaded(self, tmp_path):
+        """SHARED.md is loaded regardless of member_count."""
+        (tmp_path / "SHARED.md").write_text("Family birthdays.", encoding="utf-8")
+        builder = _builder(tmp_path)
+
+        # Private context
+        result = builder._load_bootstrap_files(member_count=2)
+        assert "## SHARED.md" in result
+        assert "Family birthdays." in result
+
+        # Group context
+        result = builder._load_bootstrap_files(member_count=5)
+        assert "## SHARED.md" in result
+        assert "Family birthdays." in result
+
+    def test_user_md_always_loaded(self, tmp_path):
+        """USER.md is loaded regardless of member_count."""
+        (tmp_path / "USER.md").write_text("Prefers concise responses.", encoding="utf-8")
+        builder = _builder(tmp_path)
+
+        # Private context
+        result = builder._load_bootstrap_files(member_count=2)
+        assert "## USER.md" in result
+        assert "Prefers concise responses." in result
+
+        # Group context
+        result = builder._load_bootstrap_files(member_count=5)
+        assert "## USER.md" in result
+        assert "Prefers concise responses." in result
+
+    def test_build_messages_passes_member_count(self, tmp_path):
+        """build_messages passes member_count to system prompt builder."""
+        (tmp_path / "USER_PRIVATE.md").write_text("Private info.", encoding="utf-8")
+        builder = _builder(tmp_path)
+
+        # Private context (member_count=2)
+        messages = builder.build_messages([], "hello", member_count=2)
+        system_prompt = messages[0]["content"]
+        assert "Private info." in system_prompt
+
+        # Group context (member_count=5)
+        messages = builder.build_messages([], "hello", member_count=5)
+        system_prompt = messages[0]["content"]
+        assert "Private info." not in system_prompt
+
+
+# ---------------------------------------------------------------------------
 # _is_template_content (static)
 # ---------------------------------------------------------------------------
 

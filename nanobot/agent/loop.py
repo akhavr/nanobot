@@ -588,6 +588,8 @@ class AgentLoop:
         pending_summary: str | None,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
+        # Extract member_count from metadata for privacy-aware context loading
+        member_count = msg.metadata.get("member_count") if msg.metadata else None
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -596,6 +598,7 @@ class AgentLoop:
             chat_id=self._runtime_chat_id(msg),
             sender_id=msg.sender_id,
             session_summary=pending_summary,
+            member_count=member_count,
         )
 
     async def _dispatch_command_inline(
