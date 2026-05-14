@@ -1252,6 +1252,10 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         mark_webui_session(ctx.session, msg.metadata)
 
+        # Persist member_count to session metadata for Dream processing
+        if msg.metadata and "member_count" in msg.metadata:
+            ctx.session.metadata["member_count"] = msg.metadata["member_count"]
+
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):
@@ -1287,6 +1291,11 @@ class AgentLoop:
             ctx.msg.metadata,
             session_key=ctx.session_key,
         )
+
+        # Persist member_count to session.metadata for Dream processing
+        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
+            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
+
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
