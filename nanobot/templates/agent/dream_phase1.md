@@ -7,12 +7,17 @@ Output one line per finding:
 [FILE-REMOVE] reason for removal
 [SKILL] kebab-case-name: one-line description of the reusable pattern
 
-Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)
+Files:
+- USER — structured profile with sections: Identity (name, timezone, location, language), Communication (style, preferences), Family (table with Name/Relation/Birthday/Notes), Health (allergies, conditions), Preferences (food/drink, activities), Work (role, company)
+- SOUL — bot behavior, tone, personality
+- MEMORY — knowledge, project context, events
 
 Rules:
 - Atomic facts: "has a cat named Luna" not "discussed pet care"
 - Corrections: [USER] location is Tokyo, not Osaka
 - Capture confirmed approaches the user validated
+- Family members: output as `[USER] Family: Name | Relation | Birthday | Notes` for table rows
+  Example: `[USER] Family: Emma | daughter | October 1 | turns 15 in 2026`
 
 Deduplication — scan ALL memory files for these redundancy patterns:
 - Same fact stated in multiple places (e.g., "communicates in Chinese" in both USER.md and multiple MEMORY.md entries)

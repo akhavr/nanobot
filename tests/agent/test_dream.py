@@ -307,3 +307,118 @@ class TestDreamPromptCaps:
         history_section = user_msg.split("## Conversation History\n")[1].split("\n\n## Current Date")[0]
         assert len(history_section) < dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS + 500
 
+
+class TestDreamUserMdStructure:
+    """Tests for structured USER.md memory with Family table support."""
+
+    async def test_dream_extracts_family_member_to_table(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Dream should extract family member mentions and format for USER.md table."""
+        store.write_user(
+            "# User Profile\n\n## Family\n\n"
+            "| Name | Relation | Birthday | Notes |\n"
+            "|------|----------|----------|-------|\n"
+        )
+        store.append_history("User said: my daughter Emma turns 15 on October 1st")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[USER] Family: Emma | daughter | October 1 | turns 15 in 2026"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
+
+        await dream.run()
+
+        call_args = mock_provider.chat_with_retry.call_args
+        user_msg = call_args.kwargs.get("messages", call_args[1].get("messages"))[1]["content"]
+        assert "## Current USER.md" in user_msg
+        assert "Family" in user_msg
+
+    async def test_dream_extracts_preference_to_user_section(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Dream should extract user preferences to the appropriate USER.md section."""
+        store.write_user(
+            "# User Profile\n\n## Preferences\n\n"
+            "- **Food/Drink**: \n"
+        )
+        store.append_history("User mentioned: I prefer wine over beer")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[USER] Preferences/Food/Drink: prefers wine"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
+
+        await dream.run()
+
+        mock_runner.run.assert_called_once()
+        spec = mock_runner.run.call_args[0][0]
+        phase2_user_msg = spec.initial_messages[1]["content"]
+        assert "[USER]" in phase2_user_msg
+        assert "wine" in phase2_user_msg
+
+    async def test_dream_preserves_existing_user_content(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Dream should preserve existing USER.md content when adding new facts."""
+        existing_content = (
+            "# User Profile\n\n"
+            "## Identity\n\n"
+            "- **Name**: John\n"
+            "- **Timezone**: UTC-5\n\n"
+            "## Family\n\n"
+            "| Name | Relation | Birthday | Notes |\n"
+            "|------|----------|----------|-------|\n"
+            "| Sarah | wife | March 15 | |\n"
+        )
+        store.write_user(existing_content)
+        store.append_history("User said: my son Jake's birthday is July 20")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[USER] Family: Jake | son | July 20 |"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
+
+        await dream.run()
+
+        call_args = mock_provider.chat_with_retry.call_args
+        user_msg = call_args.kwargs.get("messages", call_args[1].get("messages"))[1]["content"]
+        assert "John" in user_msg
+        assert "Sarah" in user_msg
+        assert "wife" in user_msg
+
+    async def test_phase1_prompt_describes_user_md_sections(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Phase 1 system prompt should describe USER.md structured sections."""
+        store.append_history("some event")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        system_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "Identity" in system_msg
+        assert "Family" in system_msg
+        assert "Health" in system_msg
+
+    async def test_phase2_prompt_includes_family_table_instructions(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        """Phase 2 system prompt should include instructions for editing Family table."""
+        store.append_history("some event")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[USER] Family: Test | child | Jan 1 |"
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        await dream.run()
+
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "Family table" in system_msg
+        assert "Name | Relation | Birthday | Notes" in system_msg
+
