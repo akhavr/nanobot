@@ -574,13 +574,16 @@ class TelegramChannel(BaseChannel):
         # Handler for bot joining/leaving groups (my_chat_member updates)
         self._app.add_handler(ChatMemberHandler(self._on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
+        # Handler for other users joining/leaving groups (for privacy boundary detection)
+        self._app.add_handler(ChatMemberHandler(self._on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+
         # Conditionally register inline keyboard callback handler
         if self.config.inline_keyboards:
             self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "callback_query", "my_chat_member"]
+            allowed_updates = ["message", "callback_query", "my_chat_member", "chat_member"]
             self.logger.debug("inline keyboards enabled")
         else:
-            allowed_updates = ["message", "my_chat_member"]
+            allowed_updates = ["message", "my_chat_member", "chat_member"]
 
         self.logger.info("Starting bot (polling mode)...")
 
@@ -1153,6 +1156,23 @@ class TelegramChannel(BaseChannel):
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
         }
 
+    async def _get_member_count(self, chat) -> int | None:
+        """Get the member count for a chat (for privacy-aware context loading).
+
+        Returns:
+            Member count for groups, or 2 for private chats (user + bot).
+            Returns None if unable to fetch.
+        """
+        if chat.type == "private":
+            return 2  # Private DM = user + bot
+        if not self._app:
+            return None
+        try:
+            return await chat.get_member_count()
+        except Exception as e:
+            self.logger.debug("Could not get member count for {}: {}", chat.id, e)
+            return None
+
     async def _extract_reply_context(self, message) -> str | None:
         """Extract text from the message being replied to, if any."""
         reply = getattr(message, "reply_to_message", None)
@@ -1335,11 +1355,15 @@ class TelegramChannel(BaseChannel):
             content = f"{cmd_part} {rest[0]}" if rest else cmd_part
         content = self._normalize_telegram_command(content)
 
+        # Build metadata with member_count for privacy-aware context loading
+        metadata = self._build_message_metadata(message, user)
+        metadata["member_count"] = await self._get_member_count(message.chat)
+
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str(message.chat_id),
             content=content,
-            metadata=self._build_message_metadata(message, user),
+            metadata=metadata,
             session_key=self._derive_topic_session_key(message),
         )
 
@@ -1408,6 +1432,7 @@ class TelegramChannel(BaseChannel):
 
         str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
+        metadata["member_count"] = await self._get_member_count(message.chat)
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
@@ -1674,3 +1699,78 @@ class TelegramChannel(BaseChannel):
                 self.logger.debug("Notified admin {} about group join", admin_id)
             except Exception as e:
                 self.logger.warning("Failed to notify admin {}: {}", admin_id, e)
+
+    async def _on_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle other users joining/leaving a group (privacy boundary detection).
+
+        When a new member joins a group that was previously 1:1 (user + bot),
+        notify the admin that private context will no longer be loaded for that chat.
+        """
+        if not update.chat_member:
+            return
+
+        chat_member = update.chat_member
+        chat = chat_member.chat
+
+        if chat.type == "private":
+            return
+
+        old_status = chat_member.old_chat_member.status if chat_member.old_chat_member else None
+        new_status = chat_member.new_chat_member.status if chat_member.new_chat_member else None
+
+        was_member = old_status in ("member", "administrator", "creator")
+        is_member = new_status in ("member", "administrator", "creator")
+
+        # Detect new member joining (not leaving)
+        if not was_member and is_member:
+            await self._check_privacy_boundary_change(chat)
+
+    async def _check_privacy_boundary_change(self, chat) -> None:
+        """Check if a group just crossed the privacy boundary (1:1 -> multi-user).
+
+        When member count goes from 2 to 3+, DM admins that private context
+        will no longer be loaded in that group.
+        """
+        if not self._app:
+            return
+
+        try:
+            member_count = await chat.get_member_count()
+        except Exception as e:
+            self.logger.debug("Could not get member count for privacy check: {}", e)
+            return
+
+        # Privacy boundary: group just went from 1:1 (2 members) to multi-user (3+)
+        # We detect this when member_count is exactly 3 (someone just joined a 2-person group)
+        if member_count == 3:
+            chat_title = chat.title or "Unknown"
+            self.logger.info(
+                "Group '{}' (ID: {}) now has {} members - private context disabled",
+                chat_title, chat.id, member_count
+            )
+            await self._notify_privacy_boundary_change(chat.id, chat_title)
+
+    async def _notify_privacy_boundary_change(self, chat_id: int, chat_title: str) -> None:
+        """DM admins when a group crosses the privacy boundary."""
+        if not self._app:
+            return
+
+        admin_users = self.config.admin_users
+        if not admin_users:
+            return
+
+        message = (
+            f"FYI: '{chat_title}' now has multiple members. "
+            f"I'll keep private info out of that chat."
+        )
+
+        for admin_id in admin_users:
+            try:
+                await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=int(admin_id),
+                    text=message,
+                )
+                self.logger.debug("Notified admin {} about privacy boundary change", admin_id)
+            except Exception as e:
+                self.logger.warning("Failed to notify admin {} about privacy change: {}", admin_id, e)

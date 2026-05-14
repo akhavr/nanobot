@@ -149,9 +149,18 @@ def _make_telegram_update(
     reply_to_message=None,
     location=None,
 ):
+    async def mock_get_member_count():
+        return 2
+
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    chat = SimpleNamespace(
+        type=chat_type,
+        is_forum=False,
+        id=-100123,
+        get_member_count=mock_get_member_count,
+    )
     message = SimpleNamespace(
-        chat=SimpleNamespace(type=chat_type, is_forum=False),
+        chat=chat,
         chat_id=-100123,
         text=text,
         caption=caption,
@@ -2291,11 +2300,8 @@ async def test_addgroup_validates_group_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_addgroup_adds_to_runtime_and_persists(tmp_path, monkeypatch) -> None:
+async def test_addgroup_adds_to_runtime_and_persists(groups_file) -> None:
     """Admin can add a group which updates runtime and persists."""
-    groups_file = tmp_path / "telegram_groups.json"
-    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
-
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
         MessageBus(),
@@ -2306,7 +2312,6 @@ async def test_addgroup_adds_to_runtime_and_persists(tmp_path, monkeypatch) -> N
 
     assert "-100999" in channel._runtime_groups
     assert groups_file.exists()
-    import json
     data = json.loads(groups_file.read_text())
     assert "-100999" in data["allowed"]
     assert "Added group" in update.message.reply_text.await_args.args[0]
@@ -2345,11 +2350,9 @@ async def test_removegroup_requires_admin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_removegroup_removes_persisted_group(tmp_path, monkeypatch) -> None:
+async def test_removegroup_removes_persisted_group(groups_file) -> None:
     """Admin can remove a persisted group."""
-    groups_file = tmp_path / "telegram_groups.json"
     groups_file.write_text('{"allowed": ["-100999"]}')
-    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
 
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
@@ -2361,7 +2364,6 @@ async def test_removegroup_removes_persisted_group(tmp_path, monkeypatch) -> Non
     await channel._on_removegroup(update, None)
 
     assert "-100999" not in channel._runtime_groups
-    import json
     data = json.loads(groups_file.read_text())
     assert "-100999" not in data["allowed"]
     assert "Removed group" in update.message.reply_text.await_args.args[0]
@@ -2414,11 +2416,9 @@ async def test_groups_requires_admin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_groups_lists_groups_with_source(tmp_path, monkeypatch) -> None:
+async def test_groups_lists_groups_with_source(groups_file) -> None:
     """Admin can list groups and see their source (config vs persisted)."""
-    groups_file = tmp_path / "telegram_groups.json"
     groups_file.write_text('{"allowed": ["-100999"]}')
-    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
 
     channel = TelegramChannel(
         TelegramConfig(
@@ -2479,11 +2479,8 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
 
 
 @pytest.mark.asyncio
-async def test_addgroup_survives_restart(tmp_path, monkeypatch) -> None:
+async def test_addgroup_survives_restart(groups_file) -> None:
     """Groups added via /addgroup persist across channel restarts."""
-    groups_file = tmp_path / "telegram_groups.json"
-    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
-
     # First channel instance: add a group
     channel1 = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
@@ -2513,9 +2510,18 @@ async def test_on_message_tracks_seen_group(groups_file):
     channel._handle_message = AsyncMock()
     channel._start_typing = lambda _: None
 
+    async def mock_get_member_count():
+        return 2
+
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
     message = SimpleNamespace(
-        chat=SimpleNamespace(type="group", is_forum=False, title="Test Group Chat"),
+        chat=SimpleNamespace(
+            type="group",
+            is_forum=False,
+            title="Test Group Chat",
+            id=-100999888,
+            get_member_count=mock_get_member_count,
+        ),
         chat_id=-100999888,
         text="hello",
         caption=None,
@@ -2702,5 +2708,171 @@ async def test_bot_join_private_chat_ignored(groups_file) -> None:
     update = SimpleNamespace(my_chat_member=chat_member)
 
     await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0
+
+
+# --- _on_chat_member tests (other user joins group - privacy boundary) ---
+
+
+def _make_chat_member_update(
+    chat_id: int,
+    chat_title: str,
+    old_status: str,
+    new_status: str,
+    member_count: int = 3,
+):
+    """Helper to create chat_member updates for member join/leave tests.
+
+    The chat.get_member_count() is mocked to return the specified member_count.
+    """
+    old_member = SimpleNamespace(status=old_status)
+    new_member = SimpleNamespace(status=new_status)
+
+    async def mock_get_member_count():
+        return member_count
+
+    chat = SimpleNamespace(
+        id=chat_id,
+        type="supergroup",
+        title=chat_title,
+        get_member_count=mock_get_member_count,
+    )
+    chat_member = SimpleNamespace(
+        chat=chat,
+        old_chat_member=old_member,
+        new_chat_member=new_member,
+    )
+    return SimpleNamespace(chat_member=chat_member)
+
+
+@pytest.mark.asyncio
+async def test_privacy_boundary_notifies_admin_when_group_grows_to_3_members(groups_file) -> None:
+    """When a group goes from 2 to 3 members, admins receive a DM about privacy."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Family Trip",
+        old_status="left",
+        new_status="member",
+        member_count=3,  # Group just grew to 3 members
+    )
+
+    await channel._on_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 1
+    msg = channel._app.bot.sent_messages[0]
+    assert msg["chat_id"] == 12345
+    assert "Family Trip" in msg["text"]
+    assert "multiple members" in msg["text"]
+    assert "private info" in msg["text"]
+
+
+@pytest.mark.asyncio
+async def test_privacy_boundary_no_notification_when_group_already_has_many_members(
+    groups_file,
+) -> None:
+    """No notification when a member joins an already multi-user group."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Large Group",
+        old_status="left",
+        new_status="member",
+        member_count=10,  # Group already has many members
+    )
+
+    await channel._on_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_privacy_boundary_no_notification_on_member_leave(groups_file) -> None:
+    """No notification when a member leaves (only on joins)."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Group",
+        old_status="member",
+        new_status="left",
+        member_count=2,
+    )
+
+    await channel._on_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_privacy_boundary_notifies_multiple_admins(groups_file) -> None:
+    """All configured admins receive the privacy boundary notification."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            admin_users=["12345", "67890"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Growing Group",
+        old_status="left",
+        new_status="member",
+        member_count=3,
+    )
+
+    await channel._on_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 2
+    notified_admins = {msg["chat_id"] for msg in channel._app.bot.sent_messages}
+    assert notified_admins == {12345, 67890}
+
+
+@pytest.mark.asyncio
+async def test_privacy_boundary_ignored_for_private_chats(groups_file) -> None:
+    """No notification when chat_member update is for a private chat."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    async def mock_get_member_count():
+        return 3
+
+    chat = SimpleNamespace(
+        id=99999,
+        type="private",
+        title=None,
+        get_member_count=mock_get_member_count,
+    )
+    old_member = SimpleNamespace(status="left")
+    new_member = SimpleNamespace(status="member")
+    chat_member = SimpleNamespace(
+        chat=chat,
+        old_chat_member=old_member,
+        new_chat_member=new_member,
+    )
+    update = SimpleNamespace(chat_member=chat_member)
+
+    await channel._on_chat_member(update, None)
 
     assert len(channel._app.bot.sent_messages) == 0

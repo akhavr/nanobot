@@ -5,9 +5,17 @@ Update memory files based on the analysis below.
 
 ## File paths (relative to workspace root)
 - SOUL.md
-- USER.md
+- USER.md (communication style, response preferences, timezone)
+- USER_PRIVATE.md (solo trips, dating, health research, finances)
+- SHARED.md (family members, birthdays, dietary info, home location)
 - memory/MEMORY.md
 - skills/<name>/SKILL.md (for [SKILL] entries only)
+
+## Content routing
+Route new facts to the correct file based on content type:
+- **USER_PRIVATE.md**: Solo trip plans, dating/social interests, health research, finances/budget
+- **USER.md**: Communication style, response preferences, timezone, language
+- **SHARED.md**: Family members, birthdays, anniversaries, allergies, dietary, home location, group trips
 
 Do NOT guess paths.
 
