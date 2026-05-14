@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,6 +18,10 @@ from nanobot.channels.telegram import (
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
     TelegramConfig,
+    _format_relative_time,
+    _load_groups_data,
+    _prune_old_seen_groups,
+    _save_groups_data,
     _StreamBuf,
 )
 
@@ -2091,3 +2097,291 @@ async def test_callback_query_ignores_unauthorized_user_before_side_effects() ->
     query.answer.assert_not_awaited()
     query.message.edit_reply_markup.assert_not_awaited()
     channel._handle_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# /groups command tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def groups_file(tmp_path, monkeypatch):
+    """Fixture to isolate telegram_groups.json to a temp directory."""
+    groups_path = tmp_path / "telegram_groups.json"
+    monkeypatch.setattr(
+        "nanobot.channels.telegram._get_groups_file",
+        lambda: groups_path,
+    )
+    return groups_path
+
+
+def test_load_groups_data_returns_empty_when_file_missing(groups_file):
+    """_load_groups_data returns empty structure when file doesn't exist."""
+    assert not groups_file.exists()
+    data = _load_groups_data()
+    assert data == {"allowed": [], "seen": []}
+
+
+def test_load_groups_data_returns_saved_data(groups_file):
+    """_load_groups_data returns saved data."""
+    test_data = {
+        "allowed": [{"id": "-123", "name": "Test Group", "added": "2026-05-14"}],
+        "seen": [{"id": "-456", "name": "Seen Group", "last_seen": "2026-05-14T10:30:00"}],
+    }
+    groups_file.write_text(json.dumps(test_data))
+    data = _load_groups_data()
+    assert data == test_data
+
+
+def test_save_groups_data_creates_file(groups_file):
+    """_save_groups_data creates the file."""
+    test_data = {"allowed": [], "seen": [{"id": "-123", "name": "Test", "last_seen": "2026-05-14T10:30:00"}]}
+    _save_groups_data(test_data)
+    assert groups_file.exists()
+    loaded = json.loads(groups_file.read_text())
+    assert loaded == test_data
+
+
+def test_prune_old_seen_groups_removes_expired_entries():
+    """_prune_old_seen_groups removes entries older than 30 days."""
+    old_time = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    recent_time = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    data = {
+        "allowed": [],
+        "seen": [
+            {"id": "-111", "name": "Old Group", "last_seen": old_time},
+            {"id": "-222", "name": "Recent Group", "last_seen": recent_time},
+        ],
+    }
+    pruned = _prune_old_seen_groups(data)
+    assert pruned is True
+    assert len(data["seen"]) == 1
+    assert data["seen"][0]["id"] == "-222"
+
+
+def test_prune_old_seen_groups_keeps_recent_entries():
+    """_prune_old_seen_groups keeps entries within 30 days."""
+    recent_time = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    data = {
+        "allowed": [],
+        "seen": [{"id": "-111", "name": "Recent Group", "last_seen": recent_time}],
+    }
+    pruned = _prune_old_seen_groups(data)
+    assert pruned is False
+    assert len(data["seen"]) == 1
+
+
+def test_format_relative_time_hours():
+    """_format_relative_time formats hours correctly."""
+    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    result = _format_relative_time(two_hours_ago)
+    assert result == "2h ago"
+
+
+def test_format_relative_time_days():
+    """_format_relative_time formats days correctly."""
+    three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    result = _format_relative_time(three_days_ago)
+    assert result == "3d ago"
+
+
+def test_format_relative_time_minutes():
+    """_format_relative_time formats minutes correctly."""
+    fifteen_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    result = _format_relative_time(fifteen_minutes_ago)
+    assert result == "15m ago"
+
+
+def test_track_seen_group_adds_new_group(groups_file):
+    """_track_seen_group adds a new group to seen list."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._track_seen_group(-100123456, "Test Group")
+
+    data = _load_groups_data()
+    assert len(data["seen"]) == 1
+    assert data["seen"][0]["id"] == "-100123456"
+    assert data["seen"][0]["name"] == "Test Group"
+    assert "last_seen" in data["seen"][0]
+
+
+def test_track_seen_group_updates_existing_group(groups_file):
+    """_track_seen_group updates existing group's last_seen."""
+    old_time = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    initial_data = {
+        "allowed": [],
+        "seen": [{"id": "-100123456", "name": "Old Name", "last_seen": old_time}],
+    }
+    _save_groups_data(initial_data)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._track_seen_group(-100123456, "New Name")
+
+    data = _load_groups_data()
+    assert len(data["seen"]) == 1
+    assert data["seen"][0]["name"] == "New Name"
+    assert data["seen"][0]["last_seen"] != old_time
+
+
+def test_track_seen_group_skips_allowed_groups(groups_file):
+    """_track_seen_group does not track groups in the allowed list."""
+    initial_data = {
+        "allowed": [{"id": "-100123456", "name": "Allowed Group", "added": "2026-05-14"}],
+        "seen": [],
+    }
+    _save_groups_data(initial_data)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._track_seen_group(-100123456, "Allowed Group")
+
+    data = _load_groups_data()
+    assert len(data["seen"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_on_groups_rejects_non_admin(groups_file):
+    """Non-admin users are rejected from /groups command."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/groups", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_groups(update, None)
+
+    update.message.reply_text.assert_awaited_once()
+    reply_text = update.message.reply_text.await_args.args[0]
+    assert "admin" in reply_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_on_groups_shows_empty_state(groups_file):
+    """Empty groups file shows no groups message."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/groups", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_groups(update, None)
+
+    update.message.reply_text.assert_awaited_once()
+    reply_text = update.message.reply_text.await_args.args[0]
+    assert "Allowed groups:" in reply_text
+    assert "(none)" in reply_text
+    assert "Seen but not allowed:" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_on_groups_shows_allowed_groups(groups_file):
+    """Allowed groups are displayed with name."""
+    initial_data = {
+        "allowed": [{"id": "-5275099223", "name": "NCL Cancun 2026", "added": "2026-05-14"}],
+        "seen": [],
+    }
+    _save_groups_data(initial_data)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/groups", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_groups(update, None)
+
+    reply_text = update.message.reply_text.await_args.args[0]
+    assert "-5275099223" in reply_text
+    assert "NCL Cancun 2026" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
+    """Seen groups are displayed with relative timestamp."""
+    recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    initial_data = {
+        "allowed": [],
+        "seen": [{"id": "-100987654321", "name": "Random Chat", "last_seen": recent_time}],
+    }
+    _save_groups_data(initial_data)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/groups", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_groups(update, None)
+
+    reply_text = update.message.reply_text.await_args.args[0]
+    assert "-100987654321" in reply_text
+    assert "Random Chat" in reply_text
+    assert "seen 2h ago" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_on_groups_ignores_unauthorized_user(groups_file):
+    """Unauthorized users cannot access /groups command."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], admin_users=["999"]),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/groups", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_groups(update, None)
+
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_tracks_seen_group(groups_file):
+    """_on_message tracks seen groups when messages come from group chats."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._handle_message = AsyncMock()
+    channel._start_typing = lambda _: None
+
+    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="group", is_forum=False, title="Test Group Chat"),
+        chat_id=-100999888,
+        text="hello",
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        reply_to_message=None,
+        photo=None,
+        voice=None,
+        audio=None,
+        document=None,
+        video=None,
+        video_note=None,
+        animation=None,
+        location=None,
+        media_group_id=None,
+        message_thread_id=None,
+        message_id=1,
+    )
+    update = SimpleNamespace(message=message, effective_user=user)
+
+    await channel._on_message(update, None)
+
+    data = _load_groups_data()
+    assert len(data["seen"]) == 1
+    assert data["seen"][0]["id"] == "-100999888"
+    assert data["seen"][0]["name"] == "Test Group Chat"
