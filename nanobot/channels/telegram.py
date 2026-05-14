@@ -36,7 +36,6 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
-TELEGRAM_GROUPS_FILE = Path.home() / ".nanobot" / "telegram_groups.json"
 # Telegram's actual API limit is 4096; we split raw markdown at 4000 as a
 # safety margin for mid-stream edits (plain text).  For _stream_end, we
 # convert to HTML first and then split at the true 4096-char boundary so
@@ -286,19 +285,36 @@ def _format_relative_time(iso_str: str) -> str:
 
 def _load_persisted_groups() -> list[str]:
     """Load persisted group IDs from the JSON file."""
-    if not TELEGRAM_GROUPS_FILE.exists():
+    path = _get_groups_file()
+    if not path.exists():
         return []
     try:
-        data = json.loads(TELEGRAM_GROUPS_FILE.read_text())
-        return list(data.get("allowed", []))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        allowed = data.get("allowed", [])
+        # Handle both string format and dict format for backward compatibility
+        return [str(g) if isinstance(g, str) else str(g.get("id", "")) for g in allowed]
     except (json.JSONDecodeError, OSError):
         return []
 
 
 def _save_persisted_groups(groups: list[str]) -> None:
-    """Save group IDs to the JSON file."""
-    TELEGRAM_GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TELEGRAM_GROUPS_FILE.write_text(json.dumps({"allowed": groups}, indent=2))
+    """Save group IDs to the JSON file.
+
+    Preserves the 'seen' section if present, only updates 'allowed'.
+    """
+    path = _get_groups_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Load existing data to preserve 'seen' section
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    existing["allowed"] = groups
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _parse_group_id(text: str) -> str | None:
@@ -430,7 +446,12 @@ class TelegramChannel(BaseChannel):
         chat_id_str = str(chat_id)
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        allowed_ids = {str(g.get("id")) for g in data.get("allowed", [])}
+        # Handle both string format and dict format for allowed groups
+        allowed = data.get("allowed", [])
+        allowed_ids = {
+            str(g) if isinstance(g, str) else str(g.get("id", ""))
+            for g in allowed
+        }
         if chat_id_str in allowed_ids:
             return
 
@@ -530,9 +551,6 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(
             MessageHandler(filters.Regex(r"^/removegroup(?:@\w+)?(?:\s+.*)?$"), self._on_removegroup)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.Regex(r"^/groups(?:@\w+)?$"), self._on_groups)
         )
 
         # Add message handler for text, photos, video, voice, documents, and locations
