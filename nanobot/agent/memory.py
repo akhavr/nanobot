@@ -1359,7 +1359,7 @@ class Dream:
         processed = 0
         for session_file in sessions_dir.glob("*.jsonl"):
             # Derive session key from filename
-            session_key = session_file.stem.replace("_", ":", 1)
+            session_key = session_file.stem.replace("_", ":")
 
             # Quick check if this looks like a group session by key pattern
             is_likely_group = any(
