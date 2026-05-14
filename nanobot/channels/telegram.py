@@ -1115,10 +1115,11 @@ class TelegramChannel(BaseChannel):
             lines.append("Allowed groups: (none)")
 
         seen = data.get("seen", [])
-        if seen:
+        seen_not_allowed = [g for g in seen if g.get("id") not in self._runtime_groups]
+        if seen_not_allowed:
             lines.append("")
             lines.append("Seen but not allowed:")
-            for g in seen:
+            for g in seen_not_allowed:
                 gid = g.get("id", "?")
                 name = g.get("name", "Unknown")
                 last_seen = g.get("last_seen", "")

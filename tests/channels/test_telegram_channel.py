@@ -2479,6 +2479,38 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
 
 
 @pytest.mark.asyncio
+async def test_groups_excludes_allowed_from_seen(groups_file):
+    """Groups in allowed list should NOT appear in 'Seen but not allowed' section."""
+    recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    initial_data = {
+        "allowed": ["-100allowed"],
+        "seen": [
+            {"id": "-100allowed", "name": "Allowed Group", "last_seen": recent_time},
+            {"id": "-100notallowed", "name": "Other Group", "last_seen": recent_time},
+        ],
+    }
+    _save_groups_data(initial_data)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    update = _make_admin_update("/groups")
+    await channel._on_groups(update, None)
+
+    reply_text = update.message.reply_text.await_args.args[0]
+    # Allowed group should appear in "Allowed groups" section
+    assert "-100allowed" in reply_text
+    assert "(persisted)" in reply_text
+    # Other group should appear in "Seen but not allowed"
+    assert "Other Group" in reply_text
+    # But the allowed group name should NOT appear (it would only show if in "seen" output)
+    assert "Allowed Group" not in reply_text
+
+
+@pytest.mark.asyncio
 async def test_addgroup_survives_restart(groups_file) -> None:
     """Groups added via /addgroup persist across channel restarts."""
     # First channel instance: add a group
