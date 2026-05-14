@@ -1411,6 +1411,120 @@ async def test_on_message_location_with_text() -> None:
     assert "[location: 51.5074, -0.1278]" in handled[0]["content"]
 
 
+# --- group_allow_from tests ---
+
+
+def test_group_allow_from_defaults_to_empty_list() -> None:
+    """group_allow_from defaults to empty list (allow all groups)."""
+    assert TelegramConfig().group_allow_from == []
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_empty_allows_all_groups() -> None:
+    """Empty group_allow_from list allows messages from any group (current behavior)."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open", group_allow_from=[]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Message from group -100123
+    await channel._on_message(_make_telegram_update(text="hello"), None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_filters_unlisted_groups() -> None:
+    """Non-empty group_allow_from rejects messages from unlisted groups."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100999"],  # Only allow this group
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Message from group -100123 (not in allowlist)
+    await channel._on_message(_make_telegram_update(text="hello"), None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_accepts_listed_groups() -> None:
+    """Non-empty group_allow_from accepts messages from listed groups."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100123"],  # Allow this group (matches _make_telegram_update)
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Message from group -100123 (in allowlist)
+    await channel._on_message(_make_telegram_update(text="hello"), None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_does_not_affect_private_chats() -> None:
+    """Private chats are unaffected by group_allow_from filter."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100999"],  # Only allow a different group
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Private chat message
+    await channel._on_message(_make_telegram_update(text="hello", chat_type="private"), None)
+
+    assert len(handled) == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests for retry amplification fix (issue #3050)
 # ---------------------------------------------------------------------------
