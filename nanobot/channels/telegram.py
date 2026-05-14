@@ -1110,7 +1110,14 @@ class TelegramChannel(BaseChannel):
             lines.append("Allowed groups:")
             for gid in sorted(self._runtime_groups):
                 source = "config" if gid in config_groups else "persisted"
-                lines.append(f"  {gid} ({source})")
+                try:
+                    chat_id_int = int(gid)
+                    name, member_count = await self._get_chat_info_by_id(chat_id_int)
+                    name_part = f" — {name}" if name else ""
+                    members_part = f", {member_count} members" if member_count else ""
+                    lines.append(f"  {gid}{name_part} ({source}{members_part})")
+                except ValueError:
+                    lines.append(f"  {gid} ({source})")
         else:
             lines.append("Allowed groups: (none)")
 
@@ -1124,7 +1131,13 @@ class TelegramChannel(BaseChannel):
                 name = g.get("name", "Unknown")
                 last_seen = g.get("last_seen", "")
                 relative = _format_relative_time(last_seen) if last_seen else "unknown"
-                lines.append(f"  {gid} — {name} (seen {relative})")
+                try:
+                    chat_id_int = int(gid)
+                    _, member_count = await self._get_chat_info_by_id(chat_id_int)
+                    members_part = f", {member_count} members" if member_count else ""
+                    lines.append(f"  {gid} — {name} (seen {relative}{members_part})")
+                except ValueError:
+                    lines.append(f"  {gid} — {name} (seen {relative})")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -1173,6 +1186,26 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             self.logger.debug("Could not get member count for {}: {}", chat.id, e)
             return None
+
+    async def _get_chat_info_by_id(self, chat_id: int) -> tuple[str | None, int | None]:
+        """Get chat name and member count by chat ID.
+
+        Returns:
+            Tuple of (chat_title, member_count). Either may be None on error.
+        """
+        if not self._app:
+            return None, None
+        try:
+            chat = await self._app.bot.get_chat(chat_id)
+            title = getattr(chat, "title", None)
+            try:
+                member_count = await chat.get_member_count()
+            except Exception:
+                member_count = None
+            return title, member_count
+        except Exception as e:
+            self.logger.debug("Could not get chat info for {}: {}", chat_id, e)
+            return None, None
 
     async def _extract_reply_context(self, message) -> str | None:
         """Extract text from the message being replied to, if any."""

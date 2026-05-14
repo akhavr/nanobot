@@ -2429,14 +2429,25 @@ async def test_groups_lists_groups_with_source(groups_file) -> None:
     )
     channel._load_and_merge_groups()
 
+    async def mock_get_chat_info(chat_id):
+        if chat_id == -100123:
+            return "Config Group", 3
+        elif chat_id == -100999:
+            return "Persisted Group", 2
+        return None, None
+
+    channel._get_chat_info_by_id = mock_get_chat_info
+
     update = _make_admin_update("/groups")
     await channel._on_groups(update, None)
 
     response = update.message.reply_text.await_args.args[0]
     assert "-100123" in response
-    assert "(config)" in response
+    assert "Config Group" in response
+    assert "(config, 3 members)" in response
     assert "-100999" in response
-    assert "(persisted)" in response
+    assert "Persisted Group" in response
+    assert "(persisted, 2 members)" in response
 
 
 @pytest.mark.asyncio
@@ -2456,7 +2467,7 @@ async def test_groups_shows_empty_message_when_no_groups() -> None:
 
 @pytest.mark.asyncio
 async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
-    """Seen groups are displayed with relative timestamp."""
+    """Seen groups are displayed with relative timestamp and member count."""
     recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     initial_data = {
         "allowed": [],
@@ -2469,6 +2480,13 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
         MessageBus(),
     )
 
+    async def mock_get_chat_info(chat_id):
+        if chat_id == -100987654321:
+            return "Random Chat", 4
+        return None, None
+
+    channel._get_chat_info_by_id = mock_get_chat_info
+
     update = _make_admin_update("/groups")
     await channel._on_groups(update, None)
 
@@ -2476,6 +2494,7 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
     assert "-100987654321" in reply_text
     assert "Random Chat" in reply_text
     assert "seen 2h ago" in reply_text
+    assert "4 members" in reply_text
 
 
 @pytest.mark.asyncio
@@ -2483,10 +2502,10 @@ async def test_groups_excludes_allowed_from_seen(groups_file):
     """Groups in allowed list should NOT appear in 'Seen but not allowed' section."""
     recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     initial_data = {
-        "allowed": ["-100allowed"],
+        "allowed": ["-100111222333"],
         "seen": [
-            {"id": "-100allowed", "name": "Allowed Group", "last_seen": recent_time},
-            {"id": "-100notallowed", "name": "Other Group", "last_seen": recent_time},
+            {"id": "-100111222333", "name": "Allowed Group", "last_seen": recent_time},
+            {"id": "-100444555666", "name": "Other Group", "last_seen": recent_time},
         ],
     }
     _save_groups_data(initial_data)
@@ -2497,17 +2516,91 @@ async def test_groups_excludes_allowed_from_seen(groups_file):
     )
     channel._load_and_merge_groups()
 
+    async def mock_get_chat_info(chat_id):
+        if chat_id == -100111222333:
+            return "Allowed Group API", 2
+        elif chat_id == -100444555666:
+            return "Other Group API", 5
+        return None, None
+
+    channel._get_chat_info_by_id = mock_get_chat_info
+
     update = _make_admin_update("/groups")
     await channel._on_groups(update, None)
 
     reply_text = update.message.reply_text.await_args.args[0]
-    # Allowed group should appear in "Allowed groups" section
-    assert "-100allowed" in reply_text
-    assert "(persisted)" in reply_text
-    # Other group should appear in "Seen but not allowed"
+    # Allowed group should appear in "Allowed groups" section with API name
+    assert "-100111222333" in reply_text
+    assert "Allowed Group API" in reply_text
+    assert "(persisted, 2 members)" in reply_text
+    # Other group should appear in "Seen but not allowed" with stored name (and API member count)
     assert "Other Group" in reply_text
-    # But the allowed group name should NOT appear (it would only show if in "seen" output)
-    assert "Allowed Group" not in reply_text
+    assert "5 members" in reply_text
+    # The allowed group should NOT appear in "Seen but not allowed" section
+    assert "Seen but not allowed" in reply_text
+    lines = reply_text.split("\n")
+    seen_section_started = False
+    for line in lines:
+        if "Seen but not allowed" in line:
+            seen_section_started = True
+        elif seen_section_started and "-100111222333" in line:
+            pytest.fail("Allowed group should not appear in 'Seen but not allowed' section")
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_by_id_returns_title_and_count() -> None:
+    """_get_chat_info_by_id returns chat title and member count."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+
+    mock_chat = AsyncMock()
+    mock_chat.title = "Test Group"
+    mock_chat.get_member_count = AsyncMock(return_value=5)
+
+    mock_bot = AsyncMock()
+    mock_bot.get_chat = AsyncMock(return_value=mock_chat)
+    channel._app = SimpleNamespace(bot=mock_bot)
+
+    title, count = await channel._get_chat_info_by_id(-100123)
+
+    assert title == "Test Group"
+    assert count == 5
+    mock_bot.get_chat.assert_called_once_with(-100123)
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_by_id_returns_none_when_no_app() -> None:
+    """_get_chat_info_by_id returns (None, None) when app is not initialized."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = None
+
+    title, count = await channel._get_chat_info_by_id(-100123)
+
+    assert title is None
+    assert count is None
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_by_id_handles_api_error() -> None:
+    """_get_chat_info_by_id returns (None, None) on API error."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+
+    mock_bot = AsyncMock()
+    mock_bot.get_chat = AsyncMock(side_effect=Exception("API error"))
+    channel._app = SimpleNamespace(bot=mock_bot)
+
+    title, count = await channel._get_chat_info_by_id(-100123)
+
+    assert title is None
+    assert count is None
 
 
 @pytest.mark.asyncio
