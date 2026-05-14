@@ -694,6 +694,51 @@ def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
     assert channel.is_allowed("not-a-number|alice") is False
 
 
+# --- is_admin tests ---
+
+
+def test_admin_users_defaults_to_empty_list() -> None:
+    """admin_users defaults to empty list."""
+    assert TelegramConfig().admin_users == []
+
+
+def test_is_admin_empty_list_returns_false_for_all() -> None:
+    """Empty admin_users list returns False for all users."""
+    channel = TelegramChannel(TelegramConfig(admin_users=[]), MessageBus())
+
+    assert channel.is_admin("12345") is False
+    assert channel.is_admin("12345|alice") is False
+    assert channel.is_admin("anyone") is False
+
+
+def test_is_admin_listed_user_returns_true() -> None:
+    """Listed user in admin_users returns True."""
+    channel = TelegramChannel(TelegramConfig(admin_users=["12345", "alice"]), MessageBus())
+
+    assert channel.is_admin("12345") is True
+    assert channel.is_admin("12345|bob") is True  # ID matches
+    assert channel.is_admin("99999|alice") is True  # username matches
+    assert channel.is_admin("alice") is True  # direct match
+
+
+def test_is_admin_unlisted_user_returns_false() -> None:
+    """Unlisted user returns False."""
+    channel = TelegramChannel(TelegramConfig(admin_users=["12345", "alice"]), MessageBus())
+
+    assert channel.is_admin("99999") is False
+    assert channel.is_admin("99999|bob") is False
+    assert channel.is_admin("bob") is False
+
+
+def test_is_admin_supports_full_sender_id_format() -> None:
+    """admin_users can contain full id|username format."""
+    channel = TelegramChannel(TelegramConfig(admin_users=["12345|alice"]), MessageBus())
+
+    assert channel.is_admin("12345|alice") is True
+    assert channel.is_admin("12345|bob") is False  # different username
+    assert channel.is_admin("99999|alice") is False  # different id
+
+
 @pytest.mark.asyncio
 async def test_send_progress_keeps_message_in_topic() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
