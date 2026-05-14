@@ -242,6 +242,7 @@ class TelegramConfig(Base):
     # Enable inline keyboard buttons in Telegram messages.
     inline_keyboards: bool = False
     stream_edit_interval: float = Field(default=_STREAM_EDIT_INTERVAL_DEFAULT, ge=0.1)
+    admin_users: list[str] = Field(default_factory=list)
 
 
 class TelegramChannel(BaseChannel):
@@ -305,6 +306,22 @@ class TelegramChannel(BaseChannel):
             return False
 
         return sid in allow_list or username in allow_list
+
+    def is_admin(self, sender_id: str) -> bool:
+        """Check if sender is in the admin_users list."""
+        admin_list = self.config.admin_users
+        if not admin_list:
+            return False
+
+        sender_str = str(sender_id)
+        if sender_str in admin_list:
+            return True
+
+        if sender_str.count("|") == 1:
+            sid, username = sender_str.split("|", 1)
+            return sid in admin_list or username in admin_list
+
+        return False
 
     @staticmethod
     def _normalize_telegram_command(content: str) -> str:
