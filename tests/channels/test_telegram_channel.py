@@ -2542,3 +2542,165 @@ async def test_on_message_tracks_seen_group(groups_file):
     assert len(data["seen"]) == 1
     assert data["seen"][0]["id"] == "-100999888"
     assert data["seen"][0]["name"] == "Test Group Chat"
+
+
+# --- _on_my_chat_member tests (bot joins group) ---
+
+
+def _make_my_chat_member_update(
+    chat_id: int,
+    chat_title: str,
+    old_status: str,
+    new_status: str,
+):
+    """Helper to create my_chat_member updates for join/leave tests."""
+    old_member = SimpleNamespace(status=old_status)
+    new_member = SimpleNamespace(status=new_status)
+    chat = SimpleNamespace(id=chat_id, type="supergroup", title=chat_title)
+    chat_member = SimpleNamespace(
+        chat=chat,
+        old_chat_member=old_member,
+        new_chat_member=new_member,
+    )
+    return SimpleNamespace(my_chat_member=chat_member)
+
+
+@pytest.mark.asyncio
+async def test_bot_join_notifies_admin(groups_file) -> None:
+    """When bot joins a group, admins receive a DM notification."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_my_chat_member_update(
+        chat_id=-5275099223,
+        chat_title="Cancun Trip",
+        old_status="left",
+        new_status="member",
+    )
+
+    await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 1
+    msg = channel._app.bot.sent_messages[0]
+    assert msg["chat_id"] == 12345
+    assert "Added to group 'Cancun Trip' (ID: -5275099223)" in msg["text"]
+    assert "Use /addgroup -5275099223 to enable responses." in msg["text"]
+
+
+@pytest.mark.asyncio
+async def test_bot_join_notifies_multiple_admins(groups_file) -> None:
+    """When bot joins a group, all configured admins receive a DM."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            admin_users=["12345", "67890", "11111"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_my_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Test Group",
+        old_status="left",
+        new_status="member",
+    )
+
+    await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 3
+    notified_admins = {msg["chat_id"] for msg in channel._app.bot.sent_messages}
+    assert notified_admins == {12345, 67890, 11111}
+
+
+@pytest.mark.asyncio
+async def test_bot_join_adds_to_seen_list(groups_file) -> None:
+    """When bot joins a group, the group is added to the seen list."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_my_chat_member_update(
+        chat_id=-100999888,
+        chat_title="New Group",
+        old_status="left",
+        new_status="member",
+    )
+
+    await channel._on_my_chat_member(update, None)
+
+    data = _load_groups_data()
+    assert len(data["seen"]) == 1
+    assert data["seen"][0]["id"] == "-100999888"
+    assert data["seen"][0]["name"] == "New Group"
+
+
+@pytest.mark.asyncio
+async def test_bot_join_no_notification_without_admins(groups_file) -> None:
+    """No notification sent if admin_users is empty."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=[]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_my_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Test Group",
+        old_status="left",
+        new_status="member",
+    )
+
+    await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_bot_leave_does_not_notify(groups_file) -> None:
+    """Bot leaving a group does not trigger admin notification."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    update = _make_my_chat_member_update(
+        chat_id=-100123456,
+        chat_title="Test Group",
+        old_status="member",
+        new_status="left",
+    )
+
+    await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_bot_join_private_chat_ignored(groups_file) -> None:
+    """Bot being added to private chat does not trigger notification."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    old_member = SimpleNamespace(status="left")
+    new_member = SimpleNamespace(status="member")
+    chat = SimpleNamespace(id=99999, type="private", title=None)
+    chat_member = SimpleNamespace(
+        chat=chat,
+        old_chat_member=old_member,
+        new_chat_member=new_member,
+    )
+    update = SimpleNamespace(my_chat_member=chat_member)
+
+    await channel._on_my_chat_member(update, None)
+
+    assert len(channel._app.bot.sent_messages) == 0

@@ -23,7 +23,14 @@ from telegram import (
     Update,
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -564,13 +571,16 @@ class TelegramChannel(BaseChannel):
             )
         )
 
+        # Handler for bot joining/leaving groups (my_chat_member updates)
+        self._app.add_handler(ChatMemberHandler(self._on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
         # Conditionally register inline keyboard callback handler
         if self.config.inline_keyboards:
             self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "callback_query"]
+            allowed_updates = ["message", "callback_query", "my_chat_member"]
             self.logger.debug("inline keyboards enabled")
         else:
-            allowed_updates = ["message"]
+            allowed_updates = ["message", "my_chat_member"]
 
         self.logger.info("Starting bot (polling mode)...")
 
@@ -1612,3 +1622,55 @@ class TelegramChannel(BaseChannel):
                 "is_callback": True,
             },
         )
+
+    async def _on_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle bot being added to or removed from a group."""
+        if not update.my_chat_member:
+            return
+
+        chat_member = update.my_chat_member
+        chat = chat_member.chat
+
+        if chat.type == "private":
+            return
+
+        old_status = chat_member.old_chat_member.status if chat_member.old_chat_member else None
+        new_status = chat_member.new_chat_member.status if chat_member.new_chat_member else None
+
+        was_member = old_status in ("member", "administrator", "creator")
+        is_member = new_status in ("member", "administrator", "creator")
+
+        if not was_member and is_member:
+            chat_id = chat.id
+            chat_title = chat.title or "Unknown"
+
+            self._track_seen_group(chat_id, chat_title)
+            self.logger.info("Bot added to group '{}' (ID: {})", chat_title, chat_id)
+
+            await self._notify_admins_group_join(chat_id, chat_title)
+
+    async def _notify_admins_group_join(self, chat_id: int, chat_title: str) -> None:
+        """Send DM to all configured admins when bot joins a new group."""
+        if not self._app:
+            return
+
+        admin_users = self.config.admin_users
+        if not admin_users:
+            self.logger.debug("No admin_users configured, skipping group join notification")
+            return
+
+        message = (
+            f"Added to group '{chat_title}' (ID: {chat_id})\n"
+            f"Use /addgroup {chat_id} to enable responses."
+        )
+
+        for admin_id in admin_users:
+            try:
+                await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=int(admin_id),
+                    text=message,
+                )
+                self.logger.debug("Notified admin {} about group join", admin_id)
+            except Exception as e:
+                self.logger.warning("Failed to notify admin {}: {}", admin_id, e)
