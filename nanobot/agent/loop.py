@@ -1287,6 +1287,11 @@ class AgentLoop:
             ctx.msg.metadata,
             session_key=ctx.session_key,
         )
+
+        # Persist member_count to session.metadata for Dream processing
+        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
+            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
+
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
