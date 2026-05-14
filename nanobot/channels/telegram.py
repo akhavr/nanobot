@@ -973,12 +973,13 @@ class TelegramChannel(BaseChannel):
             return True
 
         group_allow = self.config.group_allow_from
-        if group_allow and str(message.chat_id) not in group_allow:
-            return False
+        in_allowed_group = not group_allow or str(message.chat_id) in group_allow
 
-        if self.config.group_policy == "open":
+        # Fast path: policy is open and group is allowed (no need to check mentions)
+        if self.config.group_policy == "open" and in_allowed_group:
             return True
 
+        # Check if bot is @mentioned or replied to (always allowed, even from unlisted groups)
         bot_id, bot_username = await self._ensure_bot_identity()
         if bot_username:
             text = message.text or ""
@@ -999,7 +1000,11 @@ class TelegramChannel(BaseChannel):
                 return True
 
         reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
-        return bool(bot_id and reply_user and reply_user.id == bot_id)
+        if bot_id and reply_user and reply_user.id == bot_id:
+            return True
+
+        # Non-addressed messages: check group_allow_from filter
+        return in_allowed_group and self.config.group_policy == "open"
 
     def _remember_thread_context(self, message) -> None:
         """Cache Telegram thread context by chat/message id for follow-up replies."""
