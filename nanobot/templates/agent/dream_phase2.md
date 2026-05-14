@@ -19,6 +19,15 @@ Do NOT guess paths.
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools
 
+## USER.md Family table
+- USER.md has a Family table with columns: Name | Relation | Birthday | Notes
+- To add a family member, find the existing table and append a new row
+- Format: `| Name | Relation | Birthday | Notes |`
+- Example: To add "Emma | daughter | October 1 | turns 15":
+  - old_text: the last row of the table (or the header row if empty)
+  - new_text: that row + newline + `| Emma | daughter | October 1 | turns 15 in 2026 |`
+- Preserve existing rows — merge, don't replace
+
 ## Skill creation rules (for [SKILL] entries)
 - Use write_file to create skills/<name>/SKILL.md
 - Before writing, read_file `{{ skill_creator_path }}` for format reference (frontmatter structure, naming conventions, quality standards)
