@@ -2100,7 +2100,7 @@ async def test_callback_query_ignores_unauthorized_user_before_side_effects() ->
 
 
 # ---------------------------------------------------------------------------
-# /groups command tests
+# /addgroup, /removegroup, /groups command tests
 # ---------------------------------------------------------------------------
 
 
@@ -2113,6 +2113,20 @@ def groups_file(tmp_path, monkeypatch):
         lambda: groups_path,
     )
     return groups_path
+
+
+def _make_admin_update(text: str, user_id: int = 12345, username: str = "alice"):
+    """Helper to create updates for admin command tests."""
+    user = SimpleNamespace(id=user_id, username=username, first_name="Alice")
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="private"),
+        chat_id=user_id,
+        text=text,
+        message_id=1,
+        message_thread_id=None,
+        reply_text=AsyncMock(),
+    )
+    return SimpleNamespace(message=message, effective_user=user)
 
 
 def test_load_groups_data_returns_empty_when_file_missing(groups_file):
@@ -2247,62 +2261,197 @@ def test_track_seen_group_skips_allowed_groups(groups_file):
 
 
 @pytest.mark.asyncio
-async def test_on_groups_rejects_non_admin(groups_file):
-    """Non-admin users are rejected from /groups command."""
+async def test_addgroup_requires_admin() -> None:
+    """Non-admins are rejected by /addgroup."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
         MessageBus(),
     )
-    update = _make_telegram_update(text="/groups", chat_type="private")
-    update.message.reply_text = AsyncMock()
 
-    await channel._on_groups(update, None)
+    update = _make_admin_update("/addgroup -100123")
+    await channel._on_addgroup(update, None)
 
     update.message.reply_text.assert_awaited_once()
-    reply_text = update.message.reply_text.await_args.args[0]
-    assert "admin" in reply_text.lower()
+    assert "admin-only" in update.message.reply_text.await_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_on_groups_shows_empty_state(groups_file):
-    """Empty groups file shows no groups message."""
+async def test_addgroup_validates_group_id() -> None:
+    """Invalid group IDs are rejected."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
         MessageBus(),
     )
-    update = _make_telegram_update(text="/groups", chat_type="private")
-    update.message.reply_text = AsyncMock()
 
-    await channel._on_groups(update, None)
+    update = _make_admin_update("/addgroup notanumber")
+    await channel._on_addgroup(update, None)
 
     update.message.reply_text.assert_awaited_once()
-    reply_text = update.message.reply_text.await_args.args[0]
-    assert "Allowed groups:" in reply_text
-    assert "(none)" in reply_text
-    assert "Seen but not allowed:" in reply_text
+    assert "Usage:" in update.message.reply_text.await_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_on_groups_shows_allowed_groups(groups_file):
-    """Allowed groups are displayed with name."""
-    initial_data = {
-        "allowed": [{"id": "-5275099223", "name": "NCL Cancun 2026", "added": "2026-05-14"}],
-        "seen": [],
-    }
-    _save_groups_data(initial_data)
+async def test_addgroup_adds_to_runtime_and_persists(tmp_path, monkeypatch) -> None:
+    """Admin can add a group which updates runtime and persists."""
+    groups_file = tmp_path / "telegram_groups.json"
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
 
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
         MessageBus(),
     )
-    update = _make_telegram_update(text="/groups", chat_type="private")
-    update.message.reply_text = AsyncMock()
 
+    update = _make_admin_update("/addgroup -100999")
+    await channel._on_addgroup(update, None)
+
+    assert "-100999" in channel._runtime_groups
+    assert groups_file.exists()
+    import json
+    data = json.loads(groups_file.read_text())
+    assert "-100999" in data["allowed"]
+    assert "Added group" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_addgroup_rejects_duplicate() -> None:
+    """Adding an already-allowed group shows a message."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            admin_users=["12345"], group_allow_from=["-100123"]
+        ),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/addgroup -100123")
+    await channel._on_addgroup(update, None)
+
+    assert "already in the allowlist" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_removegroup_requires_admin() -> None:
+    """Non-admins are rejected by /removegroup."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/removegroup -100123")
+    await channel._on_removegroup(update, None)
+
+    update.message.reply_text.assert_awaited_once()
+    assert "admin-only" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_removegroup_removes_persisted_group(tmp_path, monkeypatch) -> None:
+    """Admin can remove a persisted group."""
+    groups_file = tmp_path / "telegram_groups.json"
+    groups_file.write_text('{"allowed": ["-100999"]}')
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    update = _make_admin_update("/removegroup -100999")
+    await channel._on_removegroup(update, None)
+
+    assert "-100999" not in channel._runtime_groups
+    import json
+    data = json.loads(groups_file.read_text())
+    assert "-100999" not in data["allowed"]
+    assert "Removed group" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_removegroup_rejects_config_groups() -> None:
+    """Groups defined in config cannot be removed dynamically."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            admin_users=["12345"], group_allow_from=["-100123"]
+        ),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/removegroup -100123")
+    await channel._on_removegroup(update, None)
+
+    assert "defined in config" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_removegroup_rejects_nonexistent_group() -> None:
+    """Removing a group not in the allowlist shows a message."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/removegroup -100999")
+    await channel._on_removegroup(update, None)
+
+    assert "not in the allowlist" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_groups_requires_admin() -> None:
+    """Non-admins are rejected by /groups."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/groups")
     await channel._on_groups(update, None)
 
-    reply_text = update.message.reply_text.await_args.args[0]
-    assert "-5275099223" in reply_text
-    assert "NCL Cancun 2026" in reply_text
+    update.message.reply_text.assert_awaited_once()
+    assert "admin-only" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_groups_lists_groups_with_source(tmp_path, monkeypatch) -> None:
+    """Admin can list groups and see their source (config vs persisted)."""
+    groups_file = tmp_path / "telegram_groups.json"
+    groups_file.write_text('{"allowed": ["-100999"]}')
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
+
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"],
+            admin_users=["12345"], group_allow_from=["-100123"]
+        ),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    update = _make_admin_update("/groups")
+    await channel._on_groups(update, None)
+
+    response = update.message.reply_text.await_args.args[0]
+    assert "-100123" in response
+    assert "(config)" in response
+    assert "-100999" in response
+    assert "(persisted)" in response
+
+
+@pytest.mark.asyncio
+async def test_groups_shows_empty_message_when_no_groups() -> None:
+    """When no groups are in the allowlist, a helpful message is shown."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/groups")
+    await channel._on_groups(update, None)
+
+    response = update.message.reply_text.await_args.args[0]
+    assert "Allowed groups: (none)" in response
 
 
 @pytest.mark.asyncio
@@ -2319,9 +2468,8 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
         MessageBus(),
     )
-    update = _make_telegram_update(text="/groups", chat_type="private")
-    update.message.reply_text = AsyncMock()
 
+    update = _make_admin_update("/groups")
     await channel._on_groups(update, None)
 
     reply_text = update.message.reply_text.await_args.args[0]
@@ -2331,18 +2479,27 @@ async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
 
 
 @pytest.mark.asyncio
-async def test_on_groups_ignores_unauthorized_user(groups_file):
-    """Unauthorized users cannot access /groups command."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], admin_users=["999"]),
+async def test_addgroup_survives_restart(tmp_path, monkeypatch) -> None:
+    """Groups added via /addgroup persist across channel restarts."""
+    groups_file = tmp_path / "telegram_groups.json"
+    monkeypatch.setattr("nanobot.channels.telegram.TELEGRAM_GROUPS_FILE", groups_file)
+
+    # First channel instance: add a group
+    channel1 = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
         MessageBus(),
     )
-    update = _make_telegram_update(text="/groups", chat_type="private")
-    update.message.reply_text = AsyncMock()
+    update = _make_admin_update("/addgroup -100999")
+    await channel1._on_addgroup(update, None)
+    assert "-100999" in channel1._runtime_groups
 
-    await channel._on_groups(update, None)
-
-    update.message.reply_text.assert_not_awaited()
+    # Second channel instance: group should be loaded from file
+    channel2 = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel2._load_and_merge_groups()
+    assert "-100999" in channel2._runtime_groups
 
 
 @pytest.mark.asyncio
