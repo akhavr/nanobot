@@ -1165,6 +1165,7 @@ class TelegramChannel(BaseChannel):
             "username": user.username,
             "first_name": user.first_name,
             "is_group": message.chat.type != "private",
+            "chat_title": getattr(message.chat, "title", None),
             "message_thread_id": getattr(message, "message_thread_id", None),
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,

@@ -3001,3 +3001,37 @@ async def test_privacy_boundary_ignored_for_private_chats(groups_file) -> None:
     await channel._on_chat_member(update, None)
 
     assert len(channel._app.bot.sent_messages) == 0
+
+
+def test_build_message_metadata_includes_chat_title_for_groups() -> None:
+    """Verify chat_title is included in metadata for group chats."""
+    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    chat = SimpleNamespace(type="supergroup", title="Test Group", is_forum=False)
+    message = SimpleNamespace(
+        message_id=42,
+        chat=chat,
+        message_thread_id=None,
+        reply_to_message=None,
+    )
+
+    metadata = TelegramChannel._build_message_metadata(message, user)
+
+    assert metadata["chat_title"] == "Test Group"
+    assert metadata["is_group"] is True
+
+
+def test_build_message_metadata_chat_title_none_for_private() -> None:
+    """Verify chat_title is None for private chats (DMs)."""
+    user = SimpleNamespace(id=12345, username="bob", first_name="Bob")
+    chat = SimpleNamespace(type="private", is_forum=False)
+    message = SimpleNamespace(
+        message_id=99,
+        chat=chat,
+        message_thread_id=None,
+        reply_to_message=None,
+    )
+
+    metadata = TelegramChannel._build_message_metadata(message, user)
+
+    assert metadata["chat_title"] is None
+    assert metadata["is_group"] is False
