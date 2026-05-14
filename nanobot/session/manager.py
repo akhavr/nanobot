@@ -580,7 +580,7 @@ class SessionManager:
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
-            fallback_key = path.stem.replace("_", ":", 1)
+            fallback_key = path.stem.replace("_", ":")
             try:
                 # Read the metadata line and a small preview for WebUI/session lists.
                 with open(path, encoding="utf-8") as f:
@@ -588,7 +588,7 @@ class SessionManager:
                     if first_line:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
+                            key = data.get("key") or path.stem.replace("_", ":")
                             metadata = data.get("metadata", {})
                             title = metadata.get("title") if isinstance(metadata, dict) else None
                             preview = ""
