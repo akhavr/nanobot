@@ -24,6 +24,7 @@ from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    safe_filename,
     strip_think,
     truncate_text,
 )
@@ -872,6 +873,7 @@ class Dream:
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
         sessions: SessionManager | None = None,
+        multi_user: bool = False,
     ):
         self.store = store
         self.provider = provider
@@ -884,6 +886,7 @@ class Dream:
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
         self.sessions = sessions
+        self.multi_user = multi_user
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1083,6 +1086,8 @@ class Dream:
             )
         phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
 
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
         tools = self._tools
         skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
         messages: list[dict[str, Any]] = [
@@ -1194,8 +1199,169 @@ class Dream:
             lines.append(f"[{timestamp}] {role}: {content}")
         return "\n".join(lines)
 
+    def _private_session_file_names(self, metadata: dict[str, Any]) -> tuple[str, str] | None:
+        """Return the USER/USER_PRIVATE filenames for a private session."""
+        user_id = metadata.get("user_id")
+        if self.multi_user:
+            if user_id is None or user_id == "":
+                logger.warning("Private session is missing user_id metadata; skipping per-user Dream write")
+                return None
+            suffix = f"_{safe_filename(str(user_id))}"
+            return f"USER{suffix}.md", f"USER_PRIVATE{suffix}.md"
+        return "USER.md", "USER_PRIVATE.md"
+
+    async def _run_private_session(
+        self,
+        session_key: str,
+        metadata: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> bool:
+        """Process a private session, extracting facts to USER/USER_PRIVATE."""
+        last_cursor = self.store.get_session_dream_cursor(session_key)
+        unprocessed = messages[last_cursor:]
+        if not unprocessed:
+            return False
+
+        batch = unprocessed[: self.max_batch_size]
+        logger.info(
+            "Dream private session {}: processing {} messages (cursor {}→{})",
+            session_key, len(batch), last_cursor, last_cursor + len(batch),
+        )
+
+        history_text = self._format_session_messages(batch)
+        if not history_text.strip():
+            self.store.set_session_dream_cursor(session_key, last_cursor + len(batch))
+            return False
+
+        file_names = self._private_session_file_names(metadata)
+        if file_names is None:
+            return False
+        user_file_name, user_private_file_name = file_names
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        user_path = self.store.workspace / user_file_name
+        private_path = self.store.workspace / user_private_file_name
+        current_user = truncate_text(
+            self.store.read_file(user_path) or "(empty)", self._USER_FILE_MAX_CHARS,
+        )
+        current_private = truncate_text(
+            self.store.read_file(private_path) or "(empty)", self._USER_FILE_MAX_CHARS,
+        )
+
+        file_context = (
+            f"## Current Date\n{current_date}\n\n"
+            f"## Session Key\n{session_key}\n\n"
+            f"## Current {user_file_name} ({len(current_user)} chars)\n{current_user}\n\n"
+            f"## Current {user_private_file_name} ({len(current_private)} chars)\n{current_private}"
+        )
+
+        phase1_prompt = f"## Conversation History\n{history_text}\n\n{file_context}"
+
+        try:
+            phase1_response = await self.provider.chat_with_retry(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": render_template(
+                            "agent/dream_phase1.md",
+                            strip=True,
+                            stale_threshold_days=_STALE_THRESHOLD_DAYS,
+                        ),
+                    },
+                    {"role": "user", "content": phase1_prompt},
+                ],
+                tools=None,
+                tool_choice=None,
+            )
+            analysis = phase1_response.content or ""
+            logger.debug(
+                "Dream private Phase 1 analysis for {} ({} chars): {}",
+                session_key, len(analysis), analysis[:300],
+            )
+        except Exception:
+            logger.exception("Dream private Phase 1 failed for {}", session_key)
+            return False
+
+        existing_skills = self._list_existing_skills()
+        skills_section = ""
+        if existing_skills:
+            skills_section = (
+                "\n\n## Existing Skills\n"
+                + "\n".join(f"- {s}" for s in existing_skills)
+            )
+        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
+
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+        tools = self._tools
+        skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
+        system_prompt = render_template(
+            "agent/dream_phase2.md",
+            strip=True,
+            skill_creator_path=str(skill_creator_path),
+            user_file=user_file_name,
+            user_private_file=user_private_file_name,
+            user_id=str(metadata.get("user_id", "")),
+            multi_user=self.multi_user,
+        )
+        messages_list: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": phase2_prompt},
+        ]
+
+        try:
+            result = await self._runner.run(AgentRunSpec(
+                initial_messages=messages_list,
+                tools=tools,
+                model=self.model,
+                max_iterations=self.max_iterations,
+                max_tool_result_chars=self.max_tool_result_chars,
+                fail_on_tool_error=False,
+            ))
+            logger.debug(
+                "Dream private Phase 2 complete for {}: stop_reason={}, tool_events={}",
+                session_key, result.stop_reason, len(result.tool_events),
+            )
+            for ev in (result.tool_events or []):
+                logger.info(
+                    "Dream private tool_event: name={}, status={}, detail={}",
+                    ev.get("name"), ev.get("status"), ev.get("detail", "")[:200],
+                )
+        except Exception:
+            logger.exception("Dream private Phase 2 failed for {}", session_key)
+            result = None
+
+        changelog: list[str] = []
+        if result and result.tool_events:
+            for event in result.tool_events:
+                if event["status"] == "ok":
+                    changelog.append(f"{event['name']}: {event['detail']}")
+
+        if result and result.stop_reason == "completed":
+            new_cursor = last_cursor + len(batch)
+            self.store.set_session_dream_cursor(session_key, new_cursor)
+            logger.info(
+                "Dream private session {} done: {} change(s), cursor → {}",
+                session_key, len(changelog), new_cursor,
+            )
+        else:
+            reason = result.stop_reason if result else "exception"
+            logger.warning(
+                "Dream private session {} incomplete ({}): cursor NOT advanced",
+                session_key, reason,
+            )
+
+        if changelog and self.store.git.is_initialized():
+            summary = f"dream-private: {session_key}, {len(changelog)} change(s)"
+            commit_msg = f"{summary}\n\n{analysis.strip()}"
+            sha = self.store.git.auto_commit(commit_msg)
+            if sha:
+                logger.info("Dream private commit: {}", sha)
+
+        return True
+
     async def run_session(self, session_key: str) -> bool:
-        """Process a single group session, extracting facts to SHARED.md only.
+        """Process a single session, extracting facts to the appropriate files.
 
         Returns True if work was done, False otherwise.
         """
@@ -1213,8 +1379,7 @@ class Dream:
 
         # Verify this is a group session
         if not self.is_group_session(session_key, metadata):
-            logger.debug("Session {} is not a group session, skipping", session_key)
-            return False
+            return await self._run_private_session(session_key, metadata, messages)
 
         # Get cursor for this session
         last_cursor = self.store.get_session_dream_cursor(session_key)
@@ -1348,31 +1513,20 @@ class Dream:
         return True
 
     async def run_sessions(self) -> int:
-        """Process all group chat sessions. Returns count of sessions processed."""
+        """Process all stored sessions. Returns count of sessions processed."""
         if not self.sessions:
             logger.debug("Dream.run_sessions: no SessionManager configured")
             return 0
 
-        sessions_dir = self.store.workspace / "sessions"
-        if not sessions_dir.exists():
-            return 0
-
         processed = 0
-        for session_file in sessions_dir.glob("*.jsonl"):
-            # Derive session key from filename
-            session_key = session_file.stem.replace("_", ":")
-
-            # Quick check if this looks like a group session by key pattern
-            is_likely_group = any(
-                p.search(session_key) for p in self._GROUP_SESSION_KEY_PATTERNS
-            )
-            if not is_likely_group:
+        for session_info in self.sessions.list_sessions():
+            session_key = session_info.get("key")
+            if not isinstance(session_key, str) or not session_key:
                 continue
-
             try:
                 if await self.run_session(session_key):
                     processed += 1
             except Exception:
-                logger.exception("Dream failed for group session {}", session_key)
+                logger.exception("Dream failed for session {}", session_key)
 
         return processed

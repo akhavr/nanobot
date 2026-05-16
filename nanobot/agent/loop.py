@@ -175,6 +175,7 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        multi_user: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
@@ -234,6 +235,7 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self.multi_user = multi_user
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -294,6 +296,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             sessions=self.sessions,
+            multi_user=self.multi_user,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -352,6 +355,7 @@ class AgentLoop:
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
+            multi_user=config.multi_user,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
