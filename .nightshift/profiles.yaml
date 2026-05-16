@@ -1,0 +1,5 @@
+codex:
+  agent_kind: codex
+  # Uses OAuth authentication with explicit model
+  env:
+    CODEX_MODEL: gpt-5.4-mini
