@@ -80,6 +80,7 @@ IMAP_PASSWORD=your-password-here
 | `longcat` | LLM (LongCat) | [longcat.chat](https://longcat.chat/platform/docs/zh/) |
 | `ollama` | LLM (local, Ollama) | — |
 | `lm_studio` | LLM (local, LM Studio) | — |
+| `atomic_chat` | LLM (local, [Atomic Chat](https://atomic.chat/)) | — |
 | `mistral` | LLM | [docs.mistral.ai](https://docs.mistral.ai/) |
 | `stepfun` | LLM (Step Fun/阶跃星辰) | [platform.stepfun.com](https://platform.stepfun.com) |
 | `ovms` | LLM (local, OpenVINO Model Server) | [docs.openvino.ai](https://docs.openvino.ai/2026/model-server/ovms_docs_llm_quickstart.html) |
@@ -499,6 +500,36 @@ ollama run llama3.2
 
 > **Note:** Set `apiKey` to `null` for LM Studio since it runs locally and doesn't require authentication. The model name should match what's shown in the LM Studio UI.
 > `provider: "auto"` also works when `providers.lm_studio.apiBase` is configured, but setting `"provider": "lm_studio"` is the clearest option.
+
+</details>
+
+<details>
+<summary><b>Atomic Chat (local)</b></summary>
+
+[Atomic Chat](https://atomic.chat/) is a local-first desktop app that exposes an **OpenAI-compatible** HTTP API (default `http://localhost:1337/v1`). Start Atomic Chat and enable the local API server, then point nanobot at it.
+
+**1. Add to config** (partial — merge into `~/.nanobot/config.json`):
+
+```json
+{
+  "providers": {
+    "atomic_chat": {
+      "apiKey": null,
+      "apiBase": "http://localhost:1337/v1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "atomic_chat",
+      "model": "your-model-id-from-atomic-chat"
+    }
+  }
+}
+```
+
+> **Note:** Set `apiKey` to `null` if your Atomic Chat server does not require a key. If it does, set `apiKey` (or the `ATOMIC_CHAT_API_KEY` environment variable) to the value Atomic Chat expects. The `model` string must match the model id Atomic Chat exposes on its OpenAI-compatible endpoint.
+
+> `provider: "auto"` also works when `providers.atomic_chat.apiBase` is configured, but setting `"provider": "atomic_chat"` is the clearest option.
 
 </details>
 
@@ -1104,7 +1135,6 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 
 > [!TIP]
 > For production deployments, set `"restrictToWorkspace": true` and `"tools.exec.sandbox": "bwrap"` in your config to sandbox the agent.
-> In `v0.1.4.post3` and earlier, an empty `allowFrom` allowed all senders. Since `v0.1.4.post4`, empty `allowFrom` denies all access by default. To allow all senders, set `"allowFrom": ["*"]`.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -1112,9 +1142,74 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `tools.exec.sandbox` | `""` | Sandbox backend for shell commands. Set to `"bwrap"` to wrap exec calls in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox — the process can only see the workspace (read-write) and media directory (read-only); config files and API keys are hidden. Automatically enables `restrictToWorkspace` for file tools. **Linux only** — requires `bwrap` installed (`apt install bubblewrap`; pre-installed in the Docker image). Not available on macOS or Windows (bwrap depends on Linux kernel namespaces). |
 | `tools.exec.enable` | `true` | When `false`, the shell `exec` tool is not registered at all. Use this to completely disable shell command execution. |
 | `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). |
-| `channels.*.allowFrom` | `[]` (deny all) | Whitelist of user IDs. Empty denies all; use `["*"]` to allow everyone. |
+| `channels.*.allowFrom` | omitted | Access control per channel. Omit to use pairing-only mode; set `["*"]` to allow everyone; or list specific user IDs. See [Pairing](#pairing) for details. |
 
 **Docker security**: The official Docker image runs as a non-root user (`nanobot`, UID 1000) with bubblewrap pre-installed. When using `docker-compose.yml`, the container drops all Linux capabilities except `SYS_ADMIN` (required for bwrap's namespace isolation).
+
+
+## Pairing
+
+Pairing lets users get access to the bot through a simple code exchange — no config editing required. This works for both new users and existing users connecting from a new channel (e.g. someone already approved on Telegram now setting up Discord).
+
+### How it works
+
+1. A user sends a DM to the bot on any channel (Telegram, Discord, Slack, etc.) where they aren't yet approved.
+2. The bot replies with a pairing code (like `ABCD-EFGH`) and tells them to forward it to you.
+3. You approve the code:
+
+```text
+/pairing approve ABCD-EFGH
+```
+
+4. The user can now chat with the bot normally.
+
+Pairing only works in **DMs** — unapproved users in group chats are silently ignored.
+
+### Pairing-only mode
+
+By default, if you don't set `allowFrom`, anyone who isn't approved yet will get a pairing code when they DM the bot. This means you can skip `allowFrom` entirely and manage all access through pairing:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "enabled": true
+    }
+  }
+}
+```
+
+If you prefer to allow everyone without approval:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "allowFrom": ["*"]
+    }
+  }
+}
+```
+
+### Managing access
+
+| Command | What it does |
+|---------|-------------|
+| `/pairing` | Show all pending pairing requests |
+| `/pairing approve <code>` | Approve a request — the sender can now chat |
+| `/pairing deny <code>` | Reject a pending request |
+| `/pairing revoke <user_id>` | Remove a previously approved user from the current channel |
+| `/pairing revoke <channel> <user_id>` | Remove a user from a specific channel |
+
+You can find user IDs in the output of `/pairing list`.
+
+From the terminal:
+
+```bash
+nanobot agent -m "/pairing list"
+nanobot agent -m "/pairing approve ABCD-EFGH"
+```
 
 
 ## Subagent Concurrency
