@@ -141,3 +141,55 @@ async def test_state_restore_updates_member_count_when_changed(agent_loop):
 
     # Verify member_count was updated
     assert session.metadata.get("member_count") == 4
+
+
+@pytest.mark.asyncio
+async def test_state_restore_persists_user_id_to_session_metadata(agent_loop):
+    """Verify user_id from msg.metadata is persisted to session.metadata."""
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="user123",
+        chat_id="-100123456",
+        content="Hello",
+        metadata={"user_id": "user123"},
+    )
+
+    session = agent_loop.sessions.get_or_create("telegram:-100123456")
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="telegram:-100123456",
+        state=TurnState.RESTORE,
+        turn_id="test-turn-5",
+    )
+
+    await agent_loop._state_restore(ctx)
+
+    assert session.metadata.get("user_id") == "user123"
+
+
+@pytest.mark.asyncio
+async def test_state_restore_updates_user_id_when_changed(agent_loop):
+    """Verify user_id is updated when the sender changes."""
+    session = agent_loop.sessions.get_or_create("telegram:-100999")
+    session.metadata["user_id"] = "old-user"
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="user456",
+        chat_id="-100999",
+        content="New message",
+        metadata={"user_id": "user456"},
+    )
+
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="telegram:-100999",
+        state=TurnState.RESTORE,
+        turn_id="test-turn-6",
+    )
+
+    await agent_loop._state_restore(ctx)
+
+    assert session.metadata.get("user_id") == "user456"
