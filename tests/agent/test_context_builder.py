@@ -239,6 +239,21 @@ class TestPrivacySeparation:
         system_prompt = messages[0]["content"]
         assert "Private info." not in system_prompt
 
+    def test_multi_user_uses_session_user_memory(self, tmp_path):
+        """When multi-user mode is on, session.metadata.user_id selects the memory file."""
+        builder = ContextBuilder(tmp_path, multi_user=True)
+        user_store = builder._memory_store_for({"user_id": "alice"})
+        user_store.write_memory("alice memory")
+        builder.memory.write_memory("shared memory")
+
+        prompt = builder.build_system_prompt(session_metadata={"user_id": "alice"})
+        assert "alice memory" in prompt
+        assert "shared memory" not in prompt
+
+        prompt_shared = builder.build_system_prompt()
+        assert "shared memory" in prompt_shared
+        assert "alice memory" not in prompt_shared
+
 
 # ---------------------------------------------------------------------------
 # _is_template_content (static)

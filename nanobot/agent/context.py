@@ -14,6 +14,7 @@ from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
+    safe_filename,
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -29,10 +30,18 @@ class ContextBuilder:
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        multi_user: bool = False,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        self.multi_user = multi_user
         self.memory = MemoryStore(workspace)
+        self._memory_by_user_id: dict[str, MemoryStore] = {}
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -41,6 +50,8 @@ class ContextBuilder:
         channel: str | None = None,
         session_summary: str | None = None,
         member_count: int | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
 
@@ -48,14 +59,16 @@ class ContextBuilder:
             member_count: Number of members in the chat. When <= 2 (DM or 1:1 with bot),
                           USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
         """
-        parts = [self._get_identity(channel=channel)]
-
+        store = memory_store or self._memory_store_for(session_metadata)
+        parts = [self._get_identity(channel=channel, memory_store=store)]
         bootstrap = self._load_bootstrap_files(member_count=member_count)
         if bootstrap:
             parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory = store.get_memory_context()
+        if memory and not self._is_template_content(
+            store.read_memory(),
+            str(store.memory_file.relative_to(self.workspace)),
+        ):
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
@@ -68,7 +81,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        entries = store.read_unprocessed_history(since_cursor=store.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             history_text = "\n".join(
@@ -82,8 +95,13 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None) -> str:
+    def _get_identity(
+        self,
+        channel: str | None = None,
+        memory_store: MemoryStore | None = None,
+    ) -> str:
         """Get the core identity section."""
+        store = memory_store or self.memory
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -91,6 +109,8 @@ class ContextBuilder:
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            memory_file_path=str(store.memory_file.relative_to(self.workspace)),
+            history_file_path=str(store.history_file.relative_to(self.workspace)),
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -176,6 +196,7 @@ class ContextBuilder:
         session_summary: str | None = None,
         member_count: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
@@ -198,7 +219,12 @@ class ContextBuilder:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
             {"role": "system", "content": self.build_system_prompt(
-                skill_names, channel=channel, session_summary=session_summary, member_count=member_count
+                skill_names,
+                channel=channel,
+                session_summary=session_summary,
+                member_count=member_count,
+                session_metadata=session_metadata,
+                memory_store=memory_store,
             )},
             *history,
         ]
@@ -234,3 +260,22 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    def _memory_store_for(self, session_metadata: Mapping[str, Any] | None = None) -> MemoryStore:
+        """Return the appropriate MemoryStore for the current session."""
+        if not self.multi_user:
+            return self.memory
+
+        raw_user_id = session_metadata.get("user_id") if session_metadata else None
+        if not isinstance(raw_user_id, str):
+            raw_user_id = str(raw_user_id) if raw_user_id is not None else ""
+        raw_user_id = raw_user_id.strip()
+        if not raw_user_id:
+            return self.memory
+
+        user_key = safe_filename(raw_user_id)
+        if not user_key:
+            return self.memory
+        if user_key not in self._memory_by_user_id:
+            self._memory_by_user_id[user_key] = MemoryStore(self.workspace, user_id=user_key)
+        return self._memory_by_user_id[user_key]

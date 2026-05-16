@@ -44,6 +44,26 @@ class TestMemoryStoreBasicIO:
         assert "Long-term Memory" in ctx
         assert "important fact" in ctx
 
+    def test_multi_user_uses_per_user_paths(self, tmp_path):
+        store = MemoryStore(tmp_path, user_id="user-123")
+
+        assert store.memory_file.name == "MEMORY_user-123.md"
+        assert store.history_file.name == "history_user-123.jsonl"
+        assert store._cursor_file.name == ".cursor_user-123"
+        assert store._dream_cursor_file.name == ".dream_cursor_user-123"
+
+    def test_multi_user_memory_and_history_are_isolated(self, tmp_path):
+        alice = MemoryStore(tmp_path, user_id="alice")
+        bob = MemoryStore(tmp_path, user_id="bob")
+
+        alice.write_memory("alice fact")
+        alice.append_history("alice event")
+
+        assert bob.read_memory() == ""
+        assert bob.read_unprocessed_history(since_cursor=0) == []
+        assert alice.history_file.exists()
+        assert bob.history_file.exists() is False
+
 
 class TestHistoryWithCursor:
     def test_append_history_returns_cursor(self, store):
