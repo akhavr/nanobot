@@ -5,8 +5,10 @@ from __future__ import annotations
 import io
 import time
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from loguru import logger
 
@@ -48,6 +50,12 @@ class GitStore:
     def __init__(self, workspace: Path, tracked_files: list[str]):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        self._tracked_literal_files = [
+            path for path in tracked_files if not self._is_glob_path(path)
+        ]
+        self._tracked_glob_files = [
+            path for path in tracked_files if self._is_glob_path(path)
+        ]
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
@@ -94,16 +102,16 @@ class GitStore:
             else:
                 gitignore.write_text(dream_entries, encoding="utf-8")
 
-            # Ensure tracked files exist (touch them if missing) so the initial
-            # commit has something to track.
-            for rel in self._tracked_files:
+            # Ensure concrete tracked files exist (touch them if missing) so
+            # the initial commit has something to track.
+            for rel in self._tracked_literal_files:
                 p = self._workspace / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
                 if not p.exists():
                     p.write_text("", encoding="utf-8")
 
             # Initial commit
-            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
+            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._workspace_tracked_paths())
             porcelain.commit(
                 str(self._workspace),
                 message=b"init: nanobot memory store",
@@ -128,15 +136,28 @@ class GitStore:
 
         try:
             from dulwich import porcelain
+            from dulwich.repo import Repo
 
             # .gitignore excludes everything except tracked files,
             # so any staged/unstaged change must be in our files.
             st = porcelain.status(str(self._workspace))
-            if not st.unstaged and not any(st.staged.values()):
+            if not st.unstaged and not any(st.staged.values()) and not getattr(st, "untracked", None):
                 return None
 
+            tracked_paths = set(self._workspace_tracked_paths())
+            with Repo(str(self._workspace)) as repo:
+                try:
+                    head = repo.refs[b"HEAD"]
+                except KeyError:
+                    pass
+                else:
+                    commit = repo[head]
+                    if commit.type_name == b"commit":
+                        head_tree = repo[commit.tree]
+                        tracked_paths.update(self._tree_tracked_paths(repo, head_tree))
+
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
+            porcelain.add(str(self._workspace), paths=sorted(tracked_paths))
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -353,11 +374,20 @@ class GitStore:
                 tree = repo[parent_obj.tree]
 
                 restored: list[str] = []
-                for filepath in self._tracked_files:
+                restored_paths = set(self._tree_tracked_paths(repo, tree))
+                for filepath in sorted(restored_paths):
                     content = self._read_blob_from_tree(repo, tree, filepath)
                     if content is not None:
                         dest = self._workspace / filepath
                         dest.write_text(content, encoding="utf-8")
+                        restored.append(filepath)
+
+                for filepath in self._workspace_tracked_paths():
+                    if filepath in restored_paths:
+                        continue
+                    dest = self._workspace / filepath
+                    if dest.exists():
+                        dest.unlink()
                         restored.append(filepath)
 
             if not restored:
@@ -388,3 +418,54 @@ class GitStore:
             else:
                 return None
         return None
+
+    @staticmethod
+    def _is_glob_path(path: str) -> bool:
+        return any(ch in path for ch in "*?[")
+
+    def _workspace_tracked_paths(self) -> list[str]:
+        """Return concrete tracked paths that currently exist in the workspace."""
+        paths = set(self._tracked_literal_files)
+        if not self._tracked_glob_files:
+            return sorted(paths)
+
+        for candidate in self._workspace.rglob("*"):
+            if not candidate.is_file():
+                continue
+            rel = candidate.relative_to(self._workspace).as_posix()
+            if self._matches_any_glob(rel):
+                paths.add(rel)
+        return sorted(paths)
+
+    def _tree_tracked_paths(self, repo, tree) -> list[str]:
+        """Return concrete tracked paths that exist in a git tree."""
+        tree_paths = set(self._walk_tree_paths(repo, tree))
+        paths = {
+            path
+            for path in tree_paths
+            if path in self._tracked_literal_files or self._matches_any_glob(path)
+        }
+        return sorted(paths)
+
+    def _walk_tree_paths(self, repo, tree, prefix: str = "") -> Iterator[str]:
+        for entry in tree.iteritems(name_order=True):
+            name = entry.path.decode("utf-8", errors="replace")
+            rel_path = f"{prefix}/{name}" if prefix else name
+            obj = repo[entry.sha]
+            if obj.type_name == b"blob":
+                yield rel_path
+            elif obj.type_name == b"tree":
+                yield from self._walk_tree_paths(repo, obj, rel_path)
+
+    def _matches_any_glob(self, path: str) -> bool:
+        return any(fnmatchcase(path, pattern) for pattern in self._tracked_glob_files)
+DEFAULT_MEMORY_TRACKED_FILES = [
+    "SOUL.md",
+    "USER.md",
+    "USER_PRIVATE.md",
+    "SHARED.md",
+    "USER_*.md",
+    "USER_PRIVATE_*.md",
+    "memory/MEMORY.md",
+    "memory/.dream_cursor",
+]

@@ -236,6 +236,7 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self.multi_user = multi_user
 
         self.context = ContextBuilder(
             workspace,
@@ -301,6 +302,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             sessions=self.sessions,
+            multi_user=self.multi_user,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None

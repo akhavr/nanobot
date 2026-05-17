@@ -479,7 +479,7 @@ class TestDreamGroupSessionDetection:
 
 
 class TestDreamGroupSessionProcessing:
-    """Tests for group session extraction to SHARED.md only."""
+    """Tests for group and private session extraction."""
 
     @pytest.fixture
     def sessions_manager(self, tmp_path):
@@ -500,12 +500,18 @@ class TestDreamGroupSessionProcessing:
         d._runner = mock_runner
         return d
 
-    def _create_group_session(self, sessions_manager, session_key: str, messages: list[dict]):
-        """Helper to create a test group session."""
-        from nanobot.session.manager import Session
+    def _create_session(
+        self,
+        sessions_manager,
+        session_key: str,
+        messages: list[dict],
+        *,
+        member_count: int,
+    ):
+        """Helper to create a test session with explicit member count."""
         session = sessions_manager.get_or_create(session_key)
         session.messages = messages
-        session.metadata["member_count"] = 5  # Mark as group
+        session.metadata["member_count"] = member_count
         sessions_manager.save(session)
         return session
 
@@ -515,10 +521,10 @@ class TestDreamGroupSessionProcessing:
         """Group session extraction should only touch SHARED.md."""
         # Create a group session with messages
         session_key = "telegram:-1001234567890"
-        self._create_group_session(sessions_manager, session_key, [
+        self._create_session(sessions_manager, session_key, [
             {"role": "user", "content": "My daughter Emma's birthday is October 1st", "timestamp": "2026-01-15T10:00:00"},
             {"role": "assistant", "content": "I'll remember that!", "timestamp": "2026-01-15T10:00:05"},
-        ])
+        ], member_count=5)
 
         # Setup mocks
         mock_provider.chat_with_retry.return_value = MagicMock(
@@ -539,34 +545,111 @@ class TestDreamGroupSessionProcessing:
         system_msg = call_args.kwargs["messages"][0]["content"]
         assert "GROUP CONVERSATION" in system_msg or "SHARED.md" in system_msg
 
-    async def test_group_session_skips_dm_sessions(
+    async def test_private_session_uses_single_user_paths_when_multi_user_disabled(
         self, dream_with_sessions, mock_provider, mock_runner, sessions_manager,
     ):
-        """DM sessions should be skipped by run_session."""
-        # Create a DM session (positive ID)
+        """Private sessions should use the single-user USER.md paths by default."""
         session_key = "telegram:123456789"
-        self._create_group_session(sessions_manager, session_key, [
+        self._create_session(sessions_manager, session_key, [
             {"role": "user", "content": "My secret plan", "timestamp": "2026-01-15T10:00:00"},
-        ])
-        # Override to make it a DM
+        ], member_count=2)
+        session = sessions_manager.get_or_create(session_key)
+        session.metadata["user_id"] = "334424084"
+        session.metadata["member_count"] = 2
+        sessions_manager.save(session)
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[USER] Preferences: likes tea")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
+
+        result = await dream_with_sessions.run_session(session_key)
+
+        assert result is True
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "USER.md" in system_msg
+        assert "USER_PRIVATE.md" in system_msg
+
+    async def test_private_session_uses_per_user_paths_when_multi_user_enabled(
+        self, store, mock_provider, mock_runner, sessions_manager,
+    ):
+        """Private sessions should use user-scoped file names when multi-user is enabled."""
+        dream = Dream(
+            store=store,
+            provider=mock_provider,
+            model="test-model",
+            max_batch_size=5,
+            sessions=sessions_manager,
+            multi_user=True,
+        )
+        dream._runner = mock_runner
+
+        session_key = "telegram:123456789"
+        self._create_session(sessions_manager, session_key, [
+            {"role": "user", "content": "I prefer tea", "timestamp": "2026-01-15T10:00:00"},
+        ], member_count=2)
+        session = sessions_manager.get_or_create(session_key)
+        session.metadata["user_id"] = "334424084"
+        sessions_manager.save(session)
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[USER] Preferences: likes tea")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER_334424084.md"}],
+        ))
+
+        result = await dream.run_session(session_key)
+
+        assert result is True
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "USER_334424084.md" in system_msg
+        assert "USER_PRIVATE_334424084.md" in system_msg
+
+    async def test_private_session_without_user_id_falls_back_to_legacy_paths(
+        self, store, mock_provider, mock_runner, sessions_manager,
+    ):
+        """Multi-user Dream should still process private sessions that lack user_id metadata."""
+        dream = Dream(
+            store=store,
+            provider=mock_provider,
+            model="test-model",
+            max_batch_size=5,
+            sessions=sessions_manager,
+            multi_user=True,
+        )
+        dream._runner = mock_runner
+
+        session_key = "telegram:123456789"
+        self._create_session(sessions_manager, session_key, [
+            {"role": "user", "content": "I prefer tea", "timestamp": "2026-01-15T10:00:00"},
+        ], member_count=2)
         session = sessions_manager.get_or_create(session_key)
         session.metadata["member_count"] = 2
         sessions_manager.save(session)
 
-        result = await dream_with_sessions.run_session(session_key)
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[USER] Preferences: likes tea")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
 
-        assert result is False
-        mock_provider.chat_with_retry.assert_not_called()
+        result = await dream.run_session(session_key)
+
+        assert result is True
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "USER.md" in system_msg
+        assert "USER_PRIVATE.md" in system_msg
 
     async def test_group_session_advances_cursor(
         self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
     ):
         """Group session processing should advance per-session cursor."""
         session_key = "telegram:-1001234567890"
-        self._create_group_session(sessions_manager, session_key, [
+        self._create_session(sessions_manager, session_key, [
             {"role": "user", "content": "message 1", "timestamp": "2026-01-15T10:00:00"},
             {"role": "user", "content": "message 2", "timestamp": "2026-01-15T10:00:05"},
-        ])
+        ], member_count=5)
 
         mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
         mock_runner.run = AsyncMock(return_value=_make_run_result())
@@ -576,20 +659,21 @@ class TestDreamGroupSessionProcessing:
         cursor = store.get_session_dream_cursor(session_key)
         assert cursor == 2
 
-    async def test_run_sessions_processes_only_groups(
+    async def test_run_sessions_processes_group_and_private_sessions(
         self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
     ):
-        """run_sessions should only process group sessions, not DMs."""
+        """run_sessions should process both group and private sessions."""
         # Create one group and one DM session
-        self._create_group_session(sessions_manager, "telegram:-1001234567890", [
+        self._create_session(sessions_manager, "telegram:-1001234567890", [
             {"role": "user", "content": "group message", "timestamp": "2026-01-15T10:00:00"},
-        ])
+        ], member_count=5)
 
         dm_session = sessions_manager.get_or_create("telegram:123456789")
         dm_session.messages = [
             {"role": "user", "content": "private message", "timestamp": "2026-01-15T10:00:00"},
         ]
         dm_session.metadata["member_count"] = 2
+        dm_session.metadata["user_id"] = "334424084"
         sessions_manager.save(dm_session)
 
         mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
@@ -597,8 +681,8 @@ class TestDreamGroupSessionProcessing:
 
         count = await dream_with_sessions.run_sessions()
 
-        # Only the group session should be processed
-        assert count == 1
+        # Both sessions should be processed now that private-session Dream is enabled.
+        assert count == 2
 
     async def test_no_sessions_manager_returns_zero(self, store, mock_provider):
         """run_sessions without SessionManager should return 0."""
@@ -614,11 +698,11 @@ class TestDreamGroupSessionProcessing:
         """Existing group sessions (created before feature) should be processed retroactively."""
         session_key = "telegram:-1001234567890"
         # Simulate existing session with older messages
-        self._create_group_session(sessions_manager, session_key, [
+        self._create_session(sessions_manager, session_key, [
             {"role": "user", "content": "old msg 1", "timestamp": "2025-06-01T10:00:00"},
             {"role": "user", "content": "old msg 2", "timestamp": "2025-06-02T10:00:00"},
             {"role": "user", "content": "old msg 3", "timestamp": "2025-06-03T10:00:00"},
-        ])
+        ], member_count=5)
 
         # Cursor starts at 0 (no previous processing)
         assert store.get_session_dream_cursor(session_key) == 0
@@ -636,9 +720,9 @@ class TestDreamGroupSessionProcessing:
     ):
         """Phase 2 system prompt should explicitly restrict edits to SHARED.md."""
         session_key = "telegram:-1001234567890"
-        self._create_group_session(sessions_manager, session_key, [
+        self._create_session(sessions_manager, session_key, [
             {"role": "user", "content": "family info", "timestamp": "2026-01-15T10:00:00"},
-        ])
+        ], member_count=5)
 
         mock_provider.chat_with_retry.return_value = MagicMock(
             content="[SHARED] some family fact"
@@ -701,4 +785,3 @@ class TestMemoryStoreSharedFile:
         store.write_user_private("# Private\n- Health info")
         content = store.read_user_private()
         assert "Health info" in content
-

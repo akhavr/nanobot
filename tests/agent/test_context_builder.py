@@ -187,15 +187,18 @@ class TestLoadBootstrapFiles:
         assert "## USER_PRIVATE.md" not in result
         assert "Shared private info." not in result
 
-    def test_multi_user_private_file_respects_member_count(self, tmp_path):
+    def test_multi_user_group_context_skips_user_scoped_files(self, tmp_path):
         (tmp_path / "USER_123.md").write_text("Per-user profile.", encoding="utf-8")
         (tmp_path / "USER_PRIVATE_123.md").write_text("Per-user private info.", encoding="utf-8")
+        (tmp_path / "SHARED.md").write_text("Shared info.", encoding="utf-8")
         builder = _builder(tmp_path, multi_user=True)
 
         result = builder._load_bootstrap_files(member_count=5, user_id="123")
 
-        assert "## USER_123.md" in result
-        assert "Per-user profile." in result
+        assert "## SHARED.md" in result
+        assert "Shared info." in result
+        assert "## USER_123.md" not in result
+        assert "Per-user profile." not in result
         assert "## USER_PRIVATE_123.md" not in result
         assert "Per-user private info." not in result
 
@@ -277,6 +280,43 @@ class TestPrivacySeparation:
         result = builder._load_bootstrap_files(member_count=5)
         assert "## USER.md" in result
         assert "Prefers concise responses." in result
+
+    def test_multi_user_private_files_use_user_id_scoped_paths(self, tmp_path):
+        """Multi-user private contexts should load user-scoped files, not legacy USER.md."""
+        (tmp_path / "USER.md").write_text("Legacy profile.", encoding="utf-8")
+        (tmp_path / "USER_334424084.md").write_text("Scoped profile.", encoding="utf-8")
+        (tmp_path / "USER_PRIVATE_334424084.md").write_text("Scoped private.", encoding="utf-8")
+        builder = _builder(tmp_path, multi_user=True)
+
+        result = builder._load_bootstrap_files(
+            member_count=2,
+            session_metadata={"user_id": "334424084"},
+        )
+
+        assert "## USER_334424084.md" in result
+        assert "Scoped profile." in result
+        assert "## USER_PRIVATE_334424084.md" in result
+        assert "Scoped private." in result
+        assert "Legacy profile." not in result
+
+    def test_multi_user_group_context_loads_shared_only(self, tmp_path):
+        """Multi-user group chats should not load any per-user bootstrap files."""
+        (tmp_path / "USER_334424084.md").write_text("Scoped profile.", encoding="utf-8")
+        (tmp_path / "USER_PRIVATE_334424084.md").write_text("Scoped private.", encoding="utf-8")
+        (tmp_path / "SHARED.md").write_text("Shared info.", encoding="utf-8")
+        builder = _builder(tmp_path, multi_user=True)
+
+        result = builder._load_bootstrap_files(
+            member_count=5,
+            session_metadata={"user_id": "334424084"},
+        )
+
+        assert "## SHARED.md" in result
+        assert "Shared info." in result
+        assert "## USER_334424084.md" not in result
+        assert "Scoped profile." not in result
+        assert "## USER_PRIVATE_334424084.md" not in result
+        assert "Scoped private." not in result
 
     def test_build_messages_passes_member_count(self, tmp_path):
         """build_messages passes member_count to system prompt builder."""

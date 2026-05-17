@@ -67,6 +67,15 @@ class TestBuildGitignore:
         dir_lines = [l for l in content.split("\n") if l.startswith("!") and l.endswith("/")]
         assert dir_lines == []
 
+    def test_glob_patterns_are_preserved(self, tmp_path):
+        gs = GitStore(
+            tmp_path,
+            tracked_files=["SOUL.md", "USER.md", "USER_PRIVATE.md", "USER_*.md", "USER_PRIVATE_*.md"],
+        )
+        content = gs._build_gitignore()
+        assert "!USER_*.md\n" in content
+        assert "!USER_PRIVATE_*.md\n" in content
+
 
 class TestAutoCommit:
     def test_returns_none_when_not_initialized(self, git):
@@ -93,6 +102,32 @@ class TestAutoCommit:
         git_ready.auto_commit("nothing 1")
         git_ready.auto_commit("nothing 2")
         assert len(git_ready.log()) == 1  # only init commit
+
+    def test_commits_glob_tracked_user_files(self, tmp_path):
+        git = GitStore(
+            tmp_path,
+            tracked_files=["SOUL.md", "USER.md", "USER_PRIVATE.md", "USER_*.md", "USER_PRIVATE_*.md"],
+        )
+        assert git.init()
+
+        user = tmp_path / "USER_334424084.md"
+        private = tmp_path / "USER_PRIVATE_334424084.md"
+        user.write_text("profile v1", encoding="utf-8")
+        private.write_text("private v1", encoding="utf-8")
+
+        first_sha = git.auto_commit("add per-user files")
+        assert first_sha is not None
+
+        user.write_text("profile v2", encoding="utf-8")
+        private.write_text("private v2", encoding="utf-8")
+
+        second_sha = git.auto_commit("update per-user files")
+        assert second_sha is not None
+
+        revert_sha = git.revert(second_sha)
+        assert revert_sha is not None
+        assert user.read_text(encoding="utf-8") == "profile v1"
+        assert private.read_text(encoding="utf-8") == "private v1"
 
 
 class TestLog:

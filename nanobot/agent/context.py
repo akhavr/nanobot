@@ -23,7 +23,7 @@ class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "SHARED.md", "TOOLS.md"]
-    PRIVATE_FILE = "USER_PRIVATE.md"  # Only loaded when member_count <= 2
+    PRIVATE_FILE = "USER_PRIVATE.md"
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -67,7 +67,11 @@ class ContextBuilder:
             raw_user_id = session_metadata.get("user_id")
             if raw_user_id is not None:
                 resolved_user_id = str(raw_user_id).strip() or None
-        bootstrap = self._load_bootstrap_files(member_count=member_count, user_id=resolved_user_id)
+        bootstrap = self._load_bootstrap_files(
+            member_count=member_count,
+            session_metadata=session_metadata,
+            user_id=resolved_user_id,
+        )
         if bootstrap:
             parts.append(bootstrap)
         memory = store.get_memory_context()
@@ -157,6 +161,7 @@ class ContextBuilder:
     def _load_bootstrap_files(
         self,
         member_count: int | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
         user_id: str | None = None,
     ) -> str:
         """Load all bootstrap files from workspace.
@@ -164,13 +169,24 @@ class ContextBuilder:
         Args:
             member_count: Number of members in the chat. USER_PRIVATE.md is only
                           loaded when member_count <= 2 (private/1:1 context).
+            session_metadata: Session metadata used to resolve the user ID when
+                              multi-user mode is enabled.
             user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
         parts = []
         resolved_user_id = str(user_id).strip() if user_id is not None else ""
+        if not resolved_user_id and session_metadata and "user_id" in session_metadata:
+            raw_user_id = session_metadata.get("user_id")
+            if raw_user_id is not None:
+                resolved_user_id = str(raw_user_id).strip() or ""
+        is_private_context = member_count is None or member_count <= 2
 
         for filename in self.BOOTSTRAP_FILES:
-            actual_filename = self._resolve_bootstrap_filename(filename, resolved_user_id)
+            actual_filename = self._resolve_bootstrap_filename(
+                filename,
+                resolved_user_id,
+                is_private_context=is_private_context,
+            )
             if actual_filename is None:
                 continue
             file_path = self.workspace / actual_filename
@@ -180,30 +196,43 @@ class ContextBuilder:
 
         # Load USER_PRIVATE.md only in private contexts (DM or 1:1 with bot)
         # member_count None means unknown/CLI - default to private for safety
-        private_filename = self._resolve_bootstrap_filename(self.PRIVATE_FILE, resolved_user_id)
+        private_filename = self._resolve_bootstrap_filename(
+            self.PRIVATE_FILE,
+            resolved_user_id,
+            is_private_context=is_private_context,
+        )
         if private_filename is None:
             return "\n\n".join(parts) if parts else ""
         private_file = self.workspace / private_filename
         if private_file.exists():
-            is_private_context = member_count is None or member_count <= 2
             if is_private_context:
                 content = private_file.read_text(encoding="utf-8")
                 parts.append(f"## {private_filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
-    def _resolve_bootstrap_filename(self, filename: str, resolved_user_id: str) -> str | None:
+    def _resolve_bootstrap_filename(
+        self,
+        filename: str,
+        resolved_user_id: str,
+        *,
+        is_private_context: bool,
+    ) -> str | None:
         """Resolve a bootstrap filename for single-user or multi-user loading."""
-        if not self.multi_user:
-            return filename
-
-        if not resolved_user_id and filename in {"USER.md", self.PRIVATE_FILE}:
-            return None
-
         if filename == "USER.md":
-            return f"USER_{resolved_user_id}.md"
+            if self.multi_user:
+                if not is_private_context or not resolved_user_id:
+                    return None
+                return f"USER_{resolved_user_id}.md"
+            return filename
         if filename == self.PRIVATE_FILE:
-            return f"USER_PRIVATE_{resolved_user_id}.md"
+            if not is_private_context:
+                return None
+            if self.multi_user:
+                if not resolved_user_id:
+                    return None
+                return f"USER_PRIVATE_{resolved_user_id}.md"
+            return filename
         return filename
 
     @staticmethod

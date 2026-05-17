@@ -5,19 +5,20 @@ Update memory files based on the analysis below.
 
 ## File paths (relative to workspace root)
 - SOUL.md
-- USER.md (communication style, response preferences, timezone)
-- USER_PRIVATE.md (solo trips, dating, health research, finances)
+- {{ user_file_name }} (communication style, response preferences, timezone)
+- {{ user_private_file_name }} (solo trips, dating, health research, finances)
 - SHARED.md (family members, birthdays, dietary info, home location)
 - {{ memory_file_path }}
 - skills/<name>/SKILL.md (for [SKILL] entries only)
 
 ## Content routing
 Route new facts to the correct file based on content type:
-- **USER_PRIVATE.md**: Solo trip plans, dating/social interests, health research, finances/budget
-- **USER.md**: Communication style, response preferences, timezone, language
+- **{{ user_private_file }}**: Solo trip plans, dating/social interests, health research, finances/budget
+- **{{ user_file }}**: Communication style, response preferences, timezone, language
 - **SHARED.md**: Family members, birthdays, anniversaries, allergies, dietary, home location, group trips
 
 Do NOT guess paths.
+When multi-user mode is enabled, use the user-specific file paths shown above.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
@@ -27,8 +28,8 @@ Do NOT guess paths.
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools
 
-## USER.md Family table
-- USER.md has a Family table with columns: Name | Relation | Birthday | Notes
+## USER file Family table
+- {{ user_file_name }} has a Family table with columns: Name | Relation | Birthday | Notes
 - To add a family member, find the existing table and append a new row
 - Format: `| Name | Relation | Birthday | Notes |`
 - Example: To add "Emma | daughter | October 1 | turns 15":
