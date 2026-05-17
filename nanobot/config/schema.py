@@ -285,6 +285,7 @@ class ToolsConfig(Base):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     multi_user: bool = Field(
         default=False,
         validation_alias=AliasChoices("multiUser", "multi_user"),

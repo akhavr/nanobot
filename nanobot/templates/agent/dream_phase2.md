@@ -5,8 +5,8 @@ Update memory files based on the analysis below.
 
 ## File paths (relative to workspace root)
 - SOUL.md
-- {{ user_file }} (communication style, response preferences, timezone)
-- {{ user_private_file }} (solo trips, dating, health research, finances)
+- {{ user_file_name }} (communication style, response preferences, timezone)
+- {{ user_private_file_name }} (solo trips, dating, health research, finances)
 - SHARED.md (family members, birthdays, dietary info, home location)
 - {{ memory_file_path }}
 - skills/<name>/SKILL.md (for [SKILL] entries only)
@@ -18,7 +18,7 @@ Route new facts to the correct file based on content type:
 - **SHARED.md**: Family members, birthdays, anniversaries, allergies, dietary, home location, group trips
 
 Do NOT guess paths.
-When multi-user mode is enabled, the USER files already include the user_id suffix.
+When multi-user mode is enabled, use the user-specific file paths shown above.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
@@ -29,7 +29,7 @@ When multi-user mode is enabled, the USER files already include the user_id suff
 - If nothing to update, stop without calling tools
 
 ## USER file Family table
-- {{ user_file }} has a Family table with columns: Name | Relation | Birthday | Notes
+- {{ user_file_name }} has a Family table with columns: Name | Relation | Birthday | Notes
 - To add a family member, find the existing table and append a new row
 - Format: `| Name | Relation | Birthday | Notes |`
 - Example: To add "Emma | daughter | October 1 | turns 15":

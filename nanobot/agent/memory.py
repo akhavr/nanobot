@@ -18,7 +18,7 @@ from loguru import logger
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import DEFAULT_MEMORY_TRACKED_FILES, GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -120,11 +120,7 @@ class MemoryStore:
         self._session_dream_cursors_file = self.memory_dir / f".session_dream_cursors{memory_suffix}"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "USER_PRIVATE.md", "SHARED.md",
-            str(self.memory_file.relative_to(workspace)),
-            str(self._dream_cursor_file.relative_to(workspace)),
-        ])
+        self._git = GitStore(workspace, tracked_files=DEFAULT_MEMORY_TRACKED_FILES)
         self._maybe_migrate_legacy_history()
 
     @property
@@ -300,6 +296,24 @@ class MemoryStore:
 
     def write_shared(self, content: str) -> None:
         self.shared_file.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def private_session_file_names(
+        metadata: Mapping[str, Any] | None,
+        *,
+        multi_user: bool = False,
+    ) -> tuple[str, str]:
+        """Return the USER/USER_PRIVATE filenames for a private session."""
+        user_id = metadata.get("user_id") if metadata else None
+        if multi_user:
+            if user_id is None or user_id == "":
+                logger.warning(
+                    "Private session is missing user_id metadata; using legacy USER.md files",
+                )
+                return "USER.md", "USER_PRIVATE.md"
+            suffix = f"_{safe_filename(str(user_id))}"
+            return f"USER{suffix}.md", f"USER_PRIVATE{suffix}.md"
+        return "USER.md", "USER_PRIVATE.md"
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -1275,17 +1289,6 @@ class Dream:
             lines.append(f"[{timestamp}] {role}: {content}")
         return "\n".join(lines)
 
-    def _private_session_file_names(self, metadata: dict[str, Any]) -> tuple[str, str] | None:
-        """Return the USER/USER_PRIVATE filenames for a private session."""
-        user_id = metadata.get("user_id")
-        if self.multi_user:
-            if user_id is None or user_id == "":
-                logger.warning("Private session is missing user_id metadata; skipping per-user Dream write")
-                return None
-            suffix = f"_{safe_filename(str(user_id))}"
-            return f"USER{suffix}.md", f"USER_PRIVATE{suffix}.md"
-        return "USER.md", "USER_PRIVATE.md"
-
     async def _run_private_session(
         self,
         session_key: str,
@@ -1309,10 +1312,10 @@ class Dream:
             self.store.set_session_dream_cursor(session_key, last_cursor + len(batch))
             return False
 
-        file_names = self._private_session_file_names(metadata)
-        if file_names is None:
-            return False
-        user_file_name, user_private_file_name = file_names
+        user_file_name, user_private_file_name = self.store.private_session_file_names(
+            metadata,
+            multi_user=self.multi_user,
+        )
         current_date = datetime.now().strftime("%Y-%m-%d")
         user_path = self.store.workspace / user_file_name
         private_path = self.store.workspace / user_private_file_name
@@ -1375,10 +1378,8 @@ class Dream:
             "agent/dream_phase2.md",
             strip=True,
             skill_creator_path=str(skill_creator_path),
-            user_file=user_file_name,
-            user_private_file=user_private_file_name,
-            user_id=str(metadata.get("user_id", "")),
-            multi_user=self.multi_user,
+            user_file_name=user_file_name,
+            user_private_file_name=user_private_file_name,
         )
         messages_list: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},

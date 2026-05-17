@@ -59,7 +59,7 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
     if not port:
         port = 443 if parsed.scheme == "https" else 80
     try:
-        reader, writer = await asyncio.wait_for(
+        _, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=timeout,
         )
         writer.close()

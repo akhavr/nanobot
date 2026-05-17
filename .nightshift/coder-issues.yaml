@@ -4,3 +4,9 @@
   file: nanobot/agent/memory.py
   line: 16
   detail: pytest collection is blocked in this workspace because the `loguru` dependency is not installed
+- category: incomplete
+  session: 280c6ed9b8b6
+  date: 2026-05-16
+  file: nanobot/agent/context.py
+  line: 25
+  detail: ContextBuilder still hardcodes USER.md and USER_PRIVATE.md, so multi-user Dream writes are not loaded back into prompts.

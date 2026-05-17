@@ -606,6 +606,41 @@ class TestDreamGroupSessionProcessing:
         assert "USER_334424084.md" in system_msg
         assert "USER_PRIVATE_334424084.md" in system_msg
 
+    async def test_private_session_without_user_id_falls_back_to_legacy_paths(
+        self, store, mock_provider, mock_runner, sessions_manager,
+    ):
+        """Multi-user Dream should still process private sessions that lack user_id metadata."""
+        dream = Dream(
+            store=store,
+            provider=mock_provider,
+            model="test-model",
+            max_batch_size=5,
+            sessions=sessions_manager,
+            multi_user=True,
+        )
+        dream._runner = mock_runner
+
+        session_key = "telegram:123456789"
+        self._create_session(sessions_manager, session_key, [
+            {"role": "user", "content": "I prefer tea", "timestamp": "2026-01-15T10:00:00"},
+        ], member_count=2)
+        session = sessions_manager.get_or_create(session_key)
+        session.metadata["member_count"] = 2
+        sessions_manager.save(session)
+
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[USER] Preferences: likes tea")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "USER.md"}],
+        ))
+
+        result = await dream.run_session(session_key)
+
+        assert result is True
+        spec = mock_runner.run.call_args[0][0]
+        system_msg = spec.initial_messages[0]["content"]
+        assert "USER.md" in system_msg
+        assert "USER_PRIVATE.md" in system_msg
+
     async def test_group_session_advances_cursor(
         self, dream_with_sessions, mock_provider, mock_runner, sessions_manager, store,
     ):

@@ -362,7 +362,6 @@ class AgentLoop:
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
-            multi_user=config.multi_user,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
