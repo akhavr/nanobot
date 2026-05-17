@@ -8,7 +8,7 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, memory_store_for_session_metadata
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
@@ -40,6 +40,7 @@ class ContextBuilder:
         self.timezone = timezone
         self.multi_user = multi_user
         self.memory = MemoryStore(workspace)
+        self._memory_by_user_id: dict[str, MemoryStore] = {}
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -48,6 +49,8 @@ class ContextBuilder:
         channel: str | None = None,
         session_summary: str | None = None,
         member_count: int | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
         user_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
@@ -57,14 +60,21 @@ class ContextBuilder:
                           USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
             user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
-        parts = [self._get_identity(channel=channel)]
-
-        bootstrap = self._load_bootstrap_files(member_count=member_count, user_id=user_id)
+        store = memory_store or self.memory_store_for_session_metadata(session_metadata)
+        parts = [self._get_identity(channel=channel, memory_store=store)]
+        resolved_user_id = user_id
+        if resolved_user_id is None and session_metadata and "user_id" in session_metadata:
+            raw_user_id = session_metadata.get("user_id")
+            if raw_user_id is not None:
+                resolved_user_id = str(raw_user_id).strip() or None
+        bootstrap = self._load_bootstrap_files(member_count=member_count, user_id=resolved_user_id)
         if bootstrap:
             parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory = store.get_memory_context()
+        if memory and not self._is_template_content(
+            store.read_memory(),
+            str(store.memory_file.relative_to(self.workspace)),
+        ):
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
@@ -77,7 +87,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        entries = store.read_unprocessed_history(since_cursor=store.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             history_text = "\n".join(
@@ -91,8 +101,13 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None) -> str:
+    def _get_identity(
+        self,
+        channel: str | None = None,
+        memory_store: MemoryStore | None = None,
+    ) -> str:
         """Get the core identity section."""
+        store = memory_store or self.memory
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -100,6 +115,8 @@ class ContextBuilder:
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            memory_file_path=str(store.memory_file.relative_to(self.workspace)),
+            history_file_path=str(store.history_file.relative_to(self.workspace)),
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -211,6 +228,7 @@ class ContextBuilder:
         session_summary: str | None = None,
         member_count: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
@@ -242,6 +260,8 @@ class ContextBuilder:
                 channel=channel,
                 session_summary=session_summary,
                 member_count=member_count,
+                session_metadata=session_metadata,
+                memory_store=memory_store,
                 user_id=user_id,
             )},
             *history,
@@ -278,3 +298,16 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    def memory_store_for_session_metadata(
+        self,
+        session_metadata: Mapping[str, Any] | None = None,
+    ) -> MemoryStore:
+        """Return the appropriate MemoryStore for the current session."""
+        return memory_store_for_session_metadata(
+            self.workspace,
+            self.memory,
+            self._memory_by_user_id,
+            session_metadata,
+            multi_user=self.multi_user,
+        )

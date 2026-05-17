@@ -299,6 +299,7 @@ class Config(BaseSettings):
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
+        serialization_alias="modelPresets",
     )
 
     @model_validator(mode="after")

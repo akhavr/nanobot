@@ -307,7 +307,8 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     async def _run_dream():
         t0 = time.monotonic()
         try:
-            did_work = await loop.dream.run()
+            memory_store = loop._memory_store_for_session(ctx.session) if ctx.session else None
+            did_work = await loop.dream.run(memory_store=memory_store)
             sessions_processed = await loop.dream.run_sessions()
             elapsed = time.monotonic() - t0
             if did_work or sessions_processed:

@@ -102,8 +102,9 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
     loop.sessions.save(session)
 
     call_count = [0]
-    def mock_estimate(_session, *, session_summary=None):
+    def mock_estimate(_session, *, session_summary=None, memory_store=None):
         call_count[0] += 1
+        assert memory_store is loop.consolidator.store
         if call_count[0] == 1:
             return (500, "test")
         if call_count[0] == 2:
@@ -139,8 +140,9 @@ async def test_consolidation_continues_below_trigger_until_half_target(tmp_path,
 
     call_count = [0]
 
-    def mock_estimate(_session, *, session_summary=None):
+    def mock_estimate(_session, *, session_summary=None, memory_store=None):
         call_count[0] += 1
+        assert memory_store is loop.consolidator.store
         if call_count[0] == 1:
             return (500, "test")
         if call_count[0] == 2:
@@ -171,8 +173,9 @@ async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path,
 
     call_count = [0]
 
-    def mock_estimate(_session, *, session_summary=None):
+    def mock_estimate(_session, *, session_summary=None, memory_store=None):
         call_count[0] += 1
+        assert memory_store is loop.consolidator.store
         if call_count[0] == 1:
             return (500, "test")
         return (80, "test")
@@ -209,6 +212,7 @@ async def test_preflight_consolidation_receives_pending_summary(tmp_path) -> Non
     loop.consolidator.maybe_consolidate_by_tokens.assert_any_await(
         session,
         replay_max_messages=loop._max_messages,
+        memory_store=loop.consolidator.store,
     )
 
 
@@ -219,8 +223,9 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
 
-    async def track_consolidate(messages):
+    async def track_consolidate(messages, *, memory_store=None):
         order.append("consolidate")
+        assert memory_store is loop.consolidator.store
         return True
     loop.consolidator.archive = track_consolidate  # type: ignore[method-assign]
 
@@ -241,8 +246,9 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
 
     call_count = [0]
-    def mock_estimate(_session, *, session_summary=None):
+    def mock_estimate(_session, *, session_summary=None, memory_store=None):
         call_count[0] += 1
+        assert memory_store is loop.consolidator.store
         return (1000 if call_count[0] <= 1 else 80, "test")
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
 
