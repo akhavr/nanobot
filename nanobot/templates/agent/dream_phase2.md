@@ -8,7 +8,7 @@ Update memory files based on the analysis below.
 - {{ user_file }} (communication style, response preferences, timezone)
 - {{ user_private_file }} (solo trips, dating, health research, finances)
 - SHARED.md (family members, birthdays, dietary info, home location)
-- memory/MEMORY.md
+- {{ memory_file_path }}
 - skills/<name>/SKILL.md (for [SKILL] entries only)
 
 ## Content routing

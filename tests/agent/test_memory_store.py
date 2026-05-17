@@ -5,7 +5,11 @@ from datetime import datetime
 
 import pytest
 
-from nanobot.agent.memory import _HISTORY_ENTRY_HARD_CAP, MemoryStore
+from nanobot.agent.memory import (
+    _HISTORY_ENTRY_HARD_CAP,
+    MemoryStore,
+    memory_store_for_session_metadata,
+)
 
 
 @pytest.fixture
@@ -43,6 +47,39 @@ class TestMemoryStoreBasicIO:
         ctx = store.get_memory_context()
         assert "Long-term Memory" in ctx
         assert "important fact" in ctx
+
+    def test_multi_user_uses_per_user_paths(self, tmp_path):
+        store = MemoryStore(tmp_path, user_id="user-123")
+
+        assert store.memory_file.name == "MEMORY_user-123.md"
+        assert store.history_file.name == "history_user-123.jsonl"
+        assert store._cursor_file.name == ".cursor_user-123"
+        assert store._dream_cursor_file.name == ".dream_cursor_user-123"
+
+    def test_multi_user_memory_and_history_are_isolated(self, tmp_path):
+        alice = MemoryStore(tmp_path, user_id="alice")
+        bob = MemoryStore(tmp_path, user_id="bob")
+
+        alice.write_memory("alice fact")
+        alice.append_history("alice event")
+
+        assert bob.read_memory() == ""
+        assert bob.read_unprocessed_history(since_cursor=0) == []
+        assert alice.history_file.exists()
+        assert bob.history_file.exists() is False
+
+    def test_multi_user_requires_user_id_when_strict(self, tmp_path):
+        default_store = MemoryStore(tmp_path)
+
+        with pytest.raises(ValueError, match="session_metadata\\['user_id'\\]"):
+            memory_store_for_session_metadata(
+                tmp_path,
+                default_store,
+                {},
+                {},
+                multi_user=True,
+                strict_multi_user=True,
+            )
 
 
 class TestHistoryWithCursor:
@@ -305,6 +342,23 @@ class TestLegacyHistoryMigration:
         assert store.read_file(store._dream_cursor_file).strip() == "3"
         assert not legacy_file.exists()
         assert (memory_dir / "HISTORY.md.bak").read_text(encoding="utf-8") == legacy_content
+
+    def test_migrates_user_specific_legacy_history_without_backup_collision(self, tmp_path):
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        alice_legacy = memory_dir / "HISTORY_alice.md"
+        bob_legacy = memory_dir / "HISTORY_bob.md"
+        alice_content = "[2026-04-01 10:00] alice legacy\n\n"
+        bob_content = "[2026-04-01 10:01] bob legacy\n\n"
+        alice_legacy.write_text(alice_content, encoding="utf-8")
+        bob_legacy.write_text(bob_content, encoding="utf-8")
+
+        MemoryStore(tmp_path, user_id="alice")
+        MemoryStore(tmp_path, user_id="bob")
+
+        assert (memory_dir / "HISTORY_alice.md.bak").read_text(encoding="utf-8") == alice_content
+        assert (memory_dir / "HISTORY_bob.md.bak").read_text(encoding="utf-8") == bob_content
+        assert not (memory_dir / "HISTORY.md.bak").exists()
 
     def test_migrates_consecutive_entries_without_blank_lines(self, tmp_path):
         memory_dir = tmp_path / "memory"

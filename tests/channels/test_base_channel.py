@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -84,6 +85,41 @@ async def test_handle_message_dm_sends_pairing_code(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_message_dm_infers_user_id_from_sender() -> None:
+    channel = _DummyChannel({"allowFrom": ["*"]}, MessageBus())
+    channel.bus.publish_inbound = AsyncMock()
+
+    await channel._handle_message(
+        sender_id="alice",
+        chat_id="alice",
+        content="hello",
+        is_dm=True,
+    )
+
+    channel.bus.publish_inbound.assert_awaited_once()
+    msg = channel.bus.publish_inbound.await_args.args[0]
+    assert msg.metadata["user_id"] == "alice"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_group_does_not_infer_user_id_when_member_count_is_large() -> None:
+    channel = _DummyChannel({"allowFrom": ["*"]}, MessageBus())
+    channel.bus.publish_inbound = AsyncMock()
+
+    await channel._handle_message(
+        sender_id="alice",
+        chat_id="group-123",
+        content="hello",
+        metadata={"member_count": 3},
+        is_dm=False,
+    )
+
+    channel.bus.publish_inbound.assert_awaited_once()
+    msg = channel.bus.publish_inbound.await_args.args[0]
+    assert "user_id" not in msg.metadata
+
+
+@pytest.mark.asyncio
 async def test_handle_message_group_ignores_unknown() -> None:
     channel = _DummyChannel({"allowFrom": []}, MessageBus())
 
@@ -92,4 +128,3 @@ async def test_handle_message_group_ignores_unknown() -> None:
     )
 
     assert channel._sent == []
-

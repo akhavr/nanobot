@@ -399,6 +399,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
         # estimate was called (consolidation was attempted)
         consolidator.estimate_session_prompt_tokens.assert_called_once_with(
             session,
+            memory_store=store,
         )
         # but archive was not called (no valid boundary)
         consolidator.archive.assert_not_called()

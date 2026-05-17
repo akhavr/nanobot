@@ -10,7 +10,7 @@ import weakref
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import tiktoken
 from loguru import logger
@@ -39,6 +39,49 @@ if TYPE_CHECKING:
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
 
+
+def _session_memory_key(session_metadata: Mapping[str, Any] | None) -> str | None:
+    """Return the sanitized user key used for per-user memory stores."""
+    if not session_metadata:
+        return None
+    raw_user_id = session_metadata.get("user_id")
+    if raw_user_id is None:
+        return None
+    if not isinstance(raw_user_id, str):
+        raw_user_id = str(raw_user_id)
+    raw_user_id = raw_user_id.strip()
+    if not raw_user_id:
+        return None
+    user_key = safe_filename(raw_user_id)
+    return user_key or None
+
+
+def memory_store_for_session_metadata(
+    workspace: Path,
+    default_store: "MemoryStore",
+    user_store_cache: dict[str, "MemoryStore"],
+    session_metadata: Mapping[str, Any] | None,
+    *,
+    multi_user: bool,
+    strict_multi_user: bool = False,
+) -> "MemoryStore":
+    """Resolve the correct MemoryStore for the current session metadata."""
+    if not multi_user:
+        return default_store
+
+    user_key = _session_memory_key(session_metadata)
+    if not user_key:
+        if strict_multi_user:
+            raise ValueError("multi_user sessions require session_metadata['user_id']")
+        return default_store
+
+    store = user_store_cache.get(user_key)
+    if store is None:
+        store = MemoryStore(workspace, user_id=user_key)
+        user_store_cache[user_key] = store
+    return store
+
+
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md, etc."""
 
@@ -49,25 +92,38 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+        user_id: str | None = None,
+    ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
+        normalized_user_id = (
+            safe_filename(str(user_id).strip())
+            if user_id is not None and str(user_id).strip()
+            else ""
+        )
+        self.user_id = normalized_user_id or None
         self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "history.jsonl"
-        self.legacy_history_file = self.memory_dir / "HISTORY.md"
+        memory_suffix = f"_{self.user_id}" if self.user_id else ""
+        self.memory_file = self.memory_dir / f"MEMORY{memory_suffix}.md"
+        self.history_file = self.memory_dir / f"history{memory_suffix}.jsonl"
+        self.legacy_history_file = self.memory_dir / f"HISTORY{memory_suffix}.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
         self.user_private_file = workspace / "USER_PRIVATE.md"
         self.shared_file = workspace / "SHARED.md"
-        self._cursor_file = self.memory_dir / ".cursor"
-        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._session_dream_cursors_file = self.memory_dir / ".session_dream_cursors"
+        self._cursor_file = self.memory_dir / f".cursor{memory_suffix}"
+        self._dream_cursor_file = self.memory_dir / f".dream_cursor{memory_suffix}"
+        self._session_dream_cursors_file = self.memory_dir / f".session_dream_cursors{memory_suffix}"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "USER_PRIVATE.md", "SHARED.md",
-            "memory/MEMORY.md", "memory/.dream_cursor",
+            str(self.memory_file.relative_to(workspace)),
+            str(self._dream_cursor_file.relative_to(workspace)),
         ])
         self._maybe_migrate_legacy_history()
 
@@ -198,10 +254,10 @@ class MemoryStore:
             return datetime.now().strftime("%Y-%m-%d %H:%M")
 
     def _next_legacy_backup_path(self) -> Path:
-        candidate = self.memory_dir / "HISTORY.md.bak"
+        candidate = self.memory_dir / f"{self.legacy_history_file.name}.bak"
         suffix = 2
         while candidate.exists():
-            candidate = self.memory_dir / f"HISTORY.md.bak.{suffix}"
+            candidate = self.memory_dir / f"{self.legacy_history_file.name}.bak.{suffix}"
             suffix += 1
         return candidate
 
@@ -610,6 +666,8 @@ class Consolidator:
         self,
         session: Session,
         replay_max_messages: int | None,
+        *,
+        memory_store: MemoryStore | None = None,
     ) -> str | None:
         """Archive messages that would be hidden by the replay message window."""
         end_idx = self._replay_overflow_boundary(session, replay_max_messages)
@@ -624,7 +682,7 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
-        summary = await self.archive(chunk)
+        summary = await self.archive(chunk, memory_store=memory_store)
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -640,8 +698,10 @@ class Consolidator:
     def estimate_session_prompt_tokens(
         self,
         session: Session,
+        memory_store: MemoryStore | None = None,
     ) -> tuple[int, str]:
         """Estimate prompt size from the full unconsolidated session tail."""
+        store = memory_store or self.store
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         # Include archived summary in estimation so the budget accounts for it.
@@ -655,6 +715,7 @@ class Consolidator:
             sender_id=None,
             session_summary=summary,
             session_metadata=session.metadata,
+            memory_store=store,
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -682,13 +743,19 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(
+        self,
+        messages: list[dict],
+        *,
+        memory_store: MemoryStore | None = None,
+    ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
         """
         if not messages:
             return None
+        store = memory_store or self.store
         try:
             formatted = MemoryStore._format_messages(messages)
             formatted = self._truncate_to_token_budget(formatted)
@@ -710,11 +777,11 @@ class Consolidator:
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
             summary = response.content or "[no summary]"
-            self.store.append_history(summary, max_chars=_ARCHIVE_SUMMARY_MAX_CHARS)
+            store.append_history(summary, max_chars=_ARCHIVE_SUMMARY_MAX_CHARS)
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
+            store.raw_archive(messages)
             return None
 
     async def maybe_consolidate_by_tokens(
@@ -722,6 +789,7 @@ class Consolidator:
         session: Session,
         *,
         replay_max_messages: int | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -731,6 +799,7 @@ class Consolidator:
         if not session.messages or self.context_window_tokens <= 0:
             return
 
+        store = memory_store or self.store
         lock = self.get_lock(session.key)
         async with lock:
             budget = self._input_token_budget
@@ -738,10 +807,12 @@ class Consolidator:
             last_summary = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
+                memory_store=store,
             )
             try:
                 estimated, source = self.estimate_session_prompt_tokens(
                     session,
+                    memory_store=store,
                 )
             except Exception:
                 logger.exception("Token estimation failed for {}", session.key)
@@ -790,7 +861,7 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
+                summary = await self.archive(chunk, memory_store=store)
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
@@ -807,6 +878,7 @@ class Consolidator:
                 try:
                     estimated, source = self.estimate_session_prompt_tokens(
                         session,
+                        memory_store=store,
                     )
                 except Exception:
                     logger.exception("Token estimation failed for {}", session.key)
@@ -954,7 +1026,7 @@ class Dream:
 
     # -- main entry ----------------------------------------------------------
 
-    def _annotate_with_ages(self, content: str) -> str:
+    def _annotate_with_ages(self, content: str, store: MemoryStore | None = None) -> str:
         """Append per-line age suffixes to MEMORY.md content.
 
         Each non-blank line whose age exceeds ``_STALE_THRESHOLD_DAYS`` gets a
@@ -965,9 +1037,10 @@ class Dream:
         skip annotation than to tag the wrong line).
         SOUL.md and USER.md are never annotated.
         """
-        file_path = "memory/MEMORY.md"
+        store = store or self.store
+        file_path = str(store.memory_file.relative_to(store.workspace))
         try:
-            ages = self.store.git.line_ages(file_path)
+            ages = store.git.line_ages(file_path)
         except Exception:
             logger.debug("line_ages failed for {}", file_path)
             return content
@@ -1000,12 +1073,13 @@ class Dream:
             result += "\n"
         return result
 
-    async def run(self) -> bool:
+    async def run(self, memory_store: MemoryStore | None = None) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
-        last_cursor = self.store.get_last_dream_cursor()
-        entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
+        store = memory_store or self.store
+        last_cursor = store.get_last_dream_cursor()
+        entries = store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
             return False
 
@@ -1027,23 +1101,24 @@ class Dream:
         # Each file is capped in the *prompt preview* only; Phase 2 still sees
         # the full file via the read_file tool.
         current_date = datetime.now().strftime("%Y-%m-%d")
-        raw_memory = self.store.read_memory() or "(empty)"
+        raw_memory = store.read_memory() or "(empty)"
         annotated_memory = (
-            self._annotate_with_ages(raw_memory)
+            self._annotate_with_ages(raw_memory, store=store)
             if self.annotate_line_ages
             else raw_memory
         )
         current_memory = truncate_text(annotated_memory, self._MEMORY_FILE_MAX_CHARS)
         current_soul = truncate_text(
-            self.store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
+            store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
         )
         current_user = truncate_text(
-            self.store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
+            store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
         )
+        memory_name = store.memory_file.name
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
+            f"## Current {memory_name} ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
@@ -1097,6 +1172,7 @@ class Dream:
                     "agent/dream_phase2.md",
                     strip=True,
                     skill_creator_path=str(skill_creator_path),
+                    memory_file_path=str(store.memory_file.relative_to(store.workspace)),
                 ),
             },
             {"role": "user", "content": phase2_prompt},
@@ -1131,7 +1207,7 @@ class Dream:
         # Only advance cursor on successful completion to prevent silent loss
         if result and result.stop_reason == "completed":
             new_cursor = batch[-1]["cursor"]
-            self.store.set_last_dream_cursor(new_cursor)
+            store.set_last_dream_cursor(new_cursor)
             logger.info(
                 "Dream done: {} change(s), cursor advanced to {}",
                 len(changelog), new_cursor,
@@ -1143,14 +1219,14 @@ class Dream:
                 reason,
             )
 
-        self.store.compact_history()
+        store.compact_history()
 
         # Git auto-commit (only when there are actual changes)
-        if changelog and self.store.git.is_initialized():
+        if changelog and store.git.is_initialized():
             ts = batch[-1]["timestamp"]
             summary = f"dream: {ts}, {len(changelog)} change(s)"
             commit_msg = f"{summary}\n\n{analysis.strip()}"
-            sha = self.store.git.auto_commit(commit_msg)
+            sha = store.git.auto_commit(commit_msg)
             if sha:
                 logger.info("Dream commit: {}", sha)
 

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop, TurnContext, TurnState
+from nanobot.agent.memory import MemoryStore
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 
@@ -193,3 +194,69 @@ async def test_state_restore_updates_user_id_when_changed(agent_loop):
     await agent_loop._state_restore(ctx)
 
     assert session.metadata.get("user_id") == "user456"
+
+
+@pytest.mark.asyncio
+async def test_multi_user_session_uses_user_specific_memory_store(tmp_path, mock_provider):
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    session = loop.sessions.get_or_create("telegram:-100123456")
+    session.metadata["user_id"] = "alice"
+
+    store = loop.context.memory_store_for_session_metadata(session.metadata)
+
+    assert store.memory_file.name == "MEMORY_alice.md"
+    assert store.history_file.name == "history_alice.jsonl"
+
+
+@pytest.mark.asyncio
+async def test_state_build_persists_user_id_before_memory_lookup(tmp_path, mock_provider):
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    session = loop.sessions.get_or_create("telegram:-100123456")
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="user123",
+        chat_id="-100123456",
+        content="Hello",
+        metadata={"user_id": "alice"},
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="telegram:-100123456",
+        state=TurnState.BUILD,
+        turn_id="test-turn-7",
+    )
+
+    observed_user_ids: list[str | None] = []
+    original_memory_store_for_session = loop.context.memory_store_for_session_metadata
+
+    def wrapped_memory_store_for_session(session_arg):
+        observed_user_ids.append(session_arg.get("user_id"))
+        return original_memory_store_for_session(session_arg)
+
+    loop.context.memory_store_for_session_metadata = wrapped_memory_store_for_session  # type: ignore[assignment]
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    await loop._state_build(ctx)
+
+    assert observed_user_ids
+    assert set(observed_user_ids) == {"alice"}
+    assert session.metadata.get("user_id") == "alice"

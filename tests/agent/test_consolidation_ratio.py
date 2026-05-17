@@ -77,8 +77,9 @@ async def test_consolidation_ratio_controls_target(
 
     remaining_estimates = list(estimates)
 
-    def mock_estimate(_session, *, session_summary=None):
+    def mock_estimate(_session, *, session_summary=None, memory_store=None):
         assert session_summary is None
+        assert memory_store is loop.consolidator.store
         return (remaining_estimates.pop(0), "test")
 
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]

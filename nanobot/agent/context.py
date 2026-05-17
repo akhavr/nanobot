@@ -8,7 +8,7 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, memory_store_for_session_metadata
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
@@ -29,10 +29,18 @@ class ContextBuilder:
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        multi_user: bool = False,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        self.multi_user = multi_user
         self.memory = MemoryStore(workspace)
+        self._memory_by_user_id: dict[str, MemoryStore] = {}
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -41,21 +49,32 @@ class ContextBuilder:
         channel: str | None = None,
         session_summary: str | None = None,
         member_count: int | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
+        user_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
 
         Args:
             member_count: Number of members in the chat. When <= 2 (DM or 1:1 with bot),
                           USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
+            user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
-        parts = [self._get_identity(channel=channel)]
-
-        bootstrap = self._load_bootstrap_files(member_count=member_count)
+        store = memory_store or self.memory_store_for_session_metadata(session_metadata)
+        parts = [self._get_identity(channel=channel, memory_store=store)]
+        resolved_user_id = user_id
+        if resolved_user_id is None and session_metadata and "user_id" in session_metadata:
+            raw_user_id = session_metadata.get("user_id")
+            if raw_user_id is not None:
+                resolved_user_id = str(raw_user_id).strip() or None
+        bootstrap = self._load_bootstrap_files(member_count=member_count, user_id=resolved_user_id)
         if bootstrap:
             parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory = store.get_memory_context()
+        if memory and not self._is_template_content(
+            store.read_memory(),
+            str(store.memory_file.relative_to(self.workspace)),
+        ):
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
@@ -68,7 +87,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        entries = store.read_unprocessed_history(since_cursor=store.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             history_text = "\n".join(
@@ -82,8 +101,13 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None) -> str:
+    def _get_identity(
+        self,
+        channel: str | None = None,
+        memory_store: MemoryStore | None = None,
+    ) -> str:
         """Get the core identity section."""
+        store = memory_store or self.memory
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -91,6 +115,8 @@ class ContextBuilder:
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            memory_file_path=str(store.memory_file.relative_to(self.workspace)),
+            history_file_path=str(store.history_file.relative_to(self.workspace)),
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -128,31 +154,57 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self, member_count: int | None = None) -> str:
+    def _load_bootstrap_files(
+        self,
+        member_count: int | None = None,
+        user_id: str | None = None,
+    ) -> str:
         """Load all bootstrap files from workspace.
 
         Args:
             member_count: Number of members in the chat. USER_PRIVATE.md is only
                           loaded when member_count <= 2 (private/1:1 context).
+            user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
         parts = []
+        resolved_user_id = str(user_id).strip() if user_id is not None else ""
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+            actual_filename = self._resolve_bootstrap_filename(filename, resolved_user_id)
+            if actual_filename is None:
+                continue
+            file_path = self.workspace / actual_filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                parts.append(f"## {actual_filename}\n\n{content}")
 
         # Load USER_PRIVATE.md only in private contexts (DM or 1:1 with bot)
         # member_count None means unknown/CLI - default to private for safety
-        private_file = self.workspace / self.PRIVATE_FILE
+        private_filename = self._resolve_bootstrap_filename(self.PRIVATE_FILE, resolved_user_id)
+        if private_filename is None:
+            return "\n\n".join(parts) if parts else ""
+        private_file = self.workspace / private_filename
         if private_file.exists():
             is_private_context = member_count is None or member_count <= 2
             if is_private_context:
                 content = private_file.read_text(encoding="utf-8")
-                parts.append(f"## {self.PRIVATE_FILE}\n\n{content}")
+                parts.append(f"## {private_filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _resolve_bootstrap_filename(self, filename: str, resolved_user_id: str) -> str | None:
+        """Resolve a bootstrap filename for single-user or multi-user loading."""
+        if not self.multi_user:
+            return filename
+
+        if not resolved_user_id and filename in {"USER.md", self.PRIVATE_FILE}:
+            return None
+
+        if filename == "USER.md":
+            return f"USER_{resolved_user_id}.md"
+        if filename == self.PRIVATE_FILE:
+            return f"USER_PRIVATE_{resolved_user_id}.md"
+        return filename
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
@@ -176,9 +228,15 @@ class ContextBuilder:
         session_summary: str | None = None,
         member_count: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
+        user_id = None
+        if session_metadata and "user_id" in session_metadata:
+            raw_user_id = session_metadata.get("user_id")
+            if raw_user_id is not None:
+                user_id = str(raw_user_id).strip() or None
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,
@@ -198,7 +256,13 @@ class ContextBuilder:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
             {"role": "system", "content": self.build_system_prompt(
-                skill_names, channel=channel, session_summary=session_summary, member_count=member_count
+                skill_names,
+                channel=channel,
+                session_summary=session_summary,
+                member_count=member_count,
+                session_metadata=session_metadata,
+                memory_store=memory_store,
+                user_id=user_id,
             )},
             *history,
         ]
@@ -234,3 +298,16 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    def memory_store_for_session_metadata(
+        self,
+        session_metadata: Mapping[str, Any] | None = None,
+    ) -> MemoryStore:
+        """Return the appropriate MemoryStore for the current session."""
+        return memory_store_for_session_metadata(
+            self.workspace,
+            self.memory,
+            self._memory_by_user_id,
+            session_metadata,
+            multi_user=self.multi_user,
+        )

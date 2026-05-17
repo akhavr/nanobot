@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -230,7 +231,15 @@ class BaseChannel(ABC):
                 )
             return
 
-        meta = metadata or {}
+        meta = dict(metadata or {})
+        if "user_id" not in meta:
+            member_count = meta.get("member_count")
+            is_private_context = is_dm or str(chat_id) == str(sender_id)
+            if member_count is not None:
+                with suppress(TypeError, ValueError):
+                    is_private_context = is_private_context or int(member_count) <= 2
+            if is_private_context:
+                meta["user_id"] = str(sender_id)
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
 
