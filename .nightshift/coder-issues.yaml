@@ -1,0 +1,6 @@
+- category: test
+  session: 31b0c475d5b1
+  date: 2026-05-17
+  file: nanobot/agent/memory.py
+  line: 16
+  detail: pytest collection is blocked in this workspace because the `loguru` dependency is not installed

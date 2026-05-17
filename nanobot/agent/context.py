@@ -29,9 +29,16 @@ class ContextBuilder:
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        multi_user: bool = False,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        self.multi_user = multi_user
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
@@ -41,16 +48,18 @@ class ContextBuilder:
         channel: str | None = None,
         session_summary: str | None = None,
         member_count: int | None = None,
+        user_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
 
         Args:
             member_count: Number of members in the chat. When <= 2 (DM or 1:1 with bot),
                           USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
+            user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
         parts = [self._get_identity(channel=channel)]
 
-        bootstrap = self._load_bootstrap_files(member_count=member_count)
+        bootstrap = self._load_bootstrap_files(member_count=member_count, user_id=user_id)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -128,31 +137,57 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self, member_count: int | None = None) -> str:
+    def _load_bootstrap_files(
+        self,
+        member_count: int | None = None,
+        user_id: str | None = None,
+    ) -> str:
         """Load all bootstrap files from workspace.
 
         Args:
             member_count: Number of members in the chat. USER_PRIVATE.md is only
                           loaded when member_count <= 2 (private/1:1 context).
+            user_id: Channel user ID used to resolve per-user files in multi-user mode.
         """
         parts = []
+        resolved_user_id = str(user_id).strip() if user_id is not None else ""
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+            actual_filename = self._resolve_bootstrap_filename(filename, resolved_user_id)
+            if actual_filename is None:
+                continue
+            file_path = self.workspace / actual_filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                parts.append(f"## {actual_filename}\n\n{content}")
 
         # Load USER_PRIVATE.md only in private contexts (DM or 1:1 with bot)
         # member_count None means unknown/CLI - default to private for safety
-        private_file = self.workspace / self.PRIVATE_FILE
+        private_filename = self._resolve_bootstrap_filename(self.PRIVATE_FILE, resolved_user_id)
+        if private_filename is None:
+            return "\n\n".join(parts) if parts else ""
+        private_file = self.workspace / private_filename
         if private_file.exists():
             is_private_context = member_count is None or member_count <= 2
             if is_private_context:
                 content = private_file.read_text(encoding="utf-8")
-                parts.append(f"## {self.PRIVATE_FILE}\n\n{content}")
+                parts.append(f"## {private_filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _resolve_bootstrap_filename(self, filename: str, resolved_user_id: str) -> str | None:
+        """Resolve a bootstrap filename for single-user or multi-user loading."""
+        if not self.multi_user:
+            return filename
+
+        if not resolved_user_id and filename in {"USER.md", self.PRIVATE_FILE}:
+            return None
+
+        if filename == "USER.md":
+            return f"USER_{resolved_user_id}.md"
+        if filename == self.PRIVATE_FILE:
+            return f"USER_PRIVATE_{resolved_user_id}.md"
+        return filename
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
@@ -179,6 +214,11 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
+        user_id = None
+        if session_metadata and "user_id" in session_metadata:
+            raw_user_id = session_metadata.get("user_id")
+            if raw_user_id is not None:
+                user_id = str(raw_user_id).strip() or None
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,
@@ -198,7 +238,11 @@ class ContextBuilder:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
             {"role": "system", "content": self.build_system_prompt(
-                skill_names, channel=channel, session_summary=session_summary, member_count=member_count
+                skill_names,
+                channel=channel,
+                session_summary=session_summary,
+                member_count=member_count,
+                user_id=user_id,
             )},
             *history,
         ]
