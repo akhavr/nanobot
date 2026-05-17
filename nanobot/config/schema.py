@@ -285,7 +285,11 @@ class ToolsConfig(Base):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
-    multi_user: bool = False  # Enable per-user file isolation in shared deployments
+    multi_user: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("multiUser", "multi_user"),
+        serialization_alias="multiUser",
+    )  # Enable per-user file isolation in shared deployments
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)

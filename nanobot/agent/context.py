@@ -151,12 +151,11 @@ class ContextBuilder:
         """
         parts = []
         resolved_user_id = str(user_id).strip() if user_id is not None else ""
-        use_per_user_files = self.multi_user and bool(resolved_user_id)
 
         for filename in self.BOOTSTRAP_FILES:
-            actual_filename = filename
-            if use_per_user_files and filename == "USER.md":
-                actual_filename = f"USER_{resolved_user_id}.md"
+            actual_filename = self._resolve_bootstrap_filename(filename, resolved_user_id)
+            if actual_filename is None:
+                continue
             file_path = self.workspace / actual_filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
@@ -164,9 +163,9 @@ class ContextBuilder:
 
         # Load USER_PRIVATE.md only in private contexts (DM or 1:1 with bot)
         # member_count None means unknown/CLI - default to private for safety
-        private_filename = self.PRIVATE_FILE
-        if use_per_user_files:
-            private_filename = f"USER_PRIVATE_{resolved_user_id}.md"
+        private_filename = self._resolve_bootstrap_filename(self.PRIVATE_FILE, resolved_user_id)
+        if private_filename is None:
+            return "\n\n".join(parts) if parts else ""
         private_file = self.workspace / private_filename
         if private_file.exists():
             is_private_context = member_count is None or member_count <= 2
@@ -175,6 +174,20 @@ class ContextBuilder:
                 parts.append(f"## {private_filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _resolve_bootstrap_filename(self, filename: str, resolved_user_id: str) -> str | None:
+        """Resolve a bootstrap filename for single-user or multi-user loading."""
+        if not self.multi_user:
+            return filename
+
+        if not resolved_user_id and filename in {"USER.md", self.PRIVATE_FILE}:
+            return None
+
+        if filename == "USER.md":
+            return f"USER_{resolved_user_id}.md"
+        if filename == self.PRIVATE_FILE:
+            return f"USER_PRIVATE_{resolved_user_id}.md"
+        return filename
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:

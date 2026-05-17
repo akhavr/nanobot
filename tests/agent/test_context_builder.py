@@ -175,6 +175,18 @@ class TestLoadBootstrapFiles:
         assert "## USER_PRIVATE.md" not in result
         assert "Shared private info." not in result
 
+    def test_multi_user_mode_skips_shared_user_files_without_user_id(self, tmp_path):
+        (tmp_path / "USER.md").write_text("Shared user profile.", encoding="utf-8")
+        (tmp_path / "USER_PRIVATE.md").write_text("Shared private info.", encoding="utf-8")
+        builder = _builder(tmp_path, multi_user=True)
+
+        result = builder._load_bootstrap_files(member_count=2)
+
+        assert "## USER.md" not in result
+        assert "Shared user profile." not in result
+        assert "## USER_PRIVATE.md" not in result
+        assert "Shared private info." not in result
+
     def test_multi_user_private_file_respects_member_count(self, tmp_path):
         (tmp_path / "USER_123.md").write_text("Per-user profile.", encoding="utf-8")
         (tmp_path / "USER_PRIVATE_123.md").write_text("Per-user private info.", encoding="utf-8")
@@ -454,6 +466,32 @@ class TestBuildMessages:
         assert "Per-user profile." in system_prompt
         assert "## USER_PRIVATE_123.md" in system_prompt
         assert "Per-user private info." in system_prompt
+
+    def test_build_messages_without_user_id_skips_user_files_in_multi_user_mode(self, tmp_path):
+        (tmp_path / "USER.md").write_text("Shared user profile.", encoding="utf-8")
+        (tmp_path / "USER_PRIVATE.md").write_text("Shared private info.", encoding="utf-8")
+        builder = _builder(tmp_path, multi_user=True)
+
+        messages = builder.build_messages([], "hi", member_count=2)
+        system_prompt = messages[0]["content"]
+
+        assert "## USER.md" not in system_prompt
+        assert "Shared user profile." not in system_prompt
+        assert "## USER_PRIVATE.md" not in system_prompt
+        assert "Shared private info." not in system_prompt
+
+    def test_build_messages_with_blank_user_id_skips_user_files_in_multi_user_mode(self, tmp_path):
+        (tmp_path / "USER.md").write_text("Shared user profile.", encoding="utf-8")
+        (tmp_path / "USER_PRIVATE.md").write_text("Shared private info.", encoding="utf-8")
+        builder = _builder(tmp_path, multi_user=True)
+
+        messages = builder.build_messages([], "hi", member_count=2, session_metadata={"user_id": "   "})
+        system_prompt = messages[0]["content"]
+
+        assert "## USER.md" not in system_prompt
+        assert "Shared user profile." not in system_prompt
+        assert "## USER_PRIVATE.md" not in system_prompt
+        assert "Shared private info." not in system_prompt
 
     def test_goal_state_does_not_leak_without_session_metadata(self, tmp_path):
         builder = _builder(tmp_path)
