@@ -63,7 +63,6 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
             asyncio.open_connection(host, port), timeout=timeout,
         )
         writer.close()
-        await writer.wait_closed()
         return True
     except (OSError, asyncio.TimeoutError):
         return False

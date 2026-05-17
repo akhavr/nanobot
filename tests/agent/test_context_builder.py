@@ -242,7 +242,7 @@ class TestPrivacySeparation:
     def test_multi_user_uses_session_user_memory(self, tmp_path):
         """When multi-user mode is on, session.metadata.user_id selects the memory file."""
         builder = ContextBuilder(tmp_path, multi_user=True)
-        user_store = builder._memory_store_for({"user_id": "alice"})
+        user_store = builder.memory_store_for_session_metadata({"user_id": "alice"})
         user_store.write_memory("alice memory")
         builder.memory.write_memory("shared memory")
 

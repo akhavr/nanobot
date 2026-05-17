@@ -8,13 +8,12 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, memory_store_for_session_metadata
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
-    safe_filename,
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -59,7 +58,7 @@ class ContextBuilder:
             member_count: Number of members in the chat. When <= 2 (DM or 1:1 with bot),
                           USER_PRIVATE.md is included. When > 2, it's excluded for privacy.
         """
-        store = memory_store or self._memory_store_for(session_metadata)
+        store = memory_store or self.memory_store_for_session_metadata(session_metadata)
         parts = [self._get_identity(channel=channel, memory_store=store)]
         bootstrap = self._load_bootstrap_files(member_count=member_count)
         if bootstrap:
@@ -261,21 +260,15 @@ class ContextBuilder:
             return text
         return images + [{"type": "text", "text": text}]
 
-    def _memory_store_for(self, session_metadata: Mapping[str, Any] | None = None) -> MemoryStore:
+    def memory_store_for_session_metadata(
+        self,
+        session_metadata: Mapping[str, Any] | None = None,
+    ) -> MemoryStore:
         """Return the appropriate MemoryStore for the current session."""
-        if not self.multi_user:
-            return self.memory
-
-        raw_user_id = session_metadata.get("user_id") if session_metadata else None
-        if not isinstance(raw_user_id, str):
-            raw_user_id = str(raw_user_id) if raw_user_id is not None else ""
-        raw_user_id = raw_user_id.strip()
-        if not raw_user_id:
-            return self.memory
-
-        user_key = safe_filename(raw_user_id)
-        if not user_key:
-            return self.memory
-        if user_key not in self._memory_by_user_id:
-            self._memory_by_user_id[user_key] = MemoryStore(self.workspace, user_id=user_key)
-        return self._memory_by_user_id[user_key]
+        return memory_store_for_session_metadata(
+            self.workspace,
+            self.memory,
+            self._memory_by_user_id,
+            session_metadata,
+            multi_user=self.multi_user,
+        )

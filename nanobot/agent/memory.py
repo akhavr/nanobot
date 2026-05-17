@@ -10,7 +10,7 @@ import weakref
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import tiktoken
 from loguru import logger
@@ -38,6 +38,49 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
+
+
+def _session_memory_key(session_metadata: Mapping[str, Any] | None) -> str | None:
+    """Return the sanitized user key used for per-user memory stores."""
+    if not session_metadata:
+        return None
+    raw_user_id = session_metadata.get("user_id")
+    if raw_user_id is None:
+        return None
+    if not isinstance(raw_user_id, str):
+        raw_user_id = str(raw_user_id)
+    raw_user_id = raw_user_id.strip()
+    if not raw_user_id:
+        return None
+    user_key = safe_filename(raw_user_id)
+    return user_key or None
+
+
+def memory_store_for_session_metadata(
+    workspace: Path,
+    default_store: "MemoryStore",
+    user_store_cache: dict[str, "MemoryStore"],
+    session_metadata: Mapping[str, Any] | None,
+    *,
+    multi_user: bool,
+    strict_multi_user: bool = False,
+) -> "MemoryStore":
+    """Resolve the correct MemoryStore for the current session metadata."""
+    if not multi_user:
+        return default_store
+
+    user_key = _session_memory_key(session_metadata)
+    if not user_key:
+        if strict_multi_user:
+            raise ValueError("multi_user sessions require session_metadata['user_id']")
+        return default_store
+
+    store = user_store_cache.get(user_key)
+    if store is None:
+        store = MemoryStore(workspace, user_id=user_key)
+        user_store_cache[user_key] = store
+    return store
+
 
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md, etc."""
@@ -211,10 +254,10 @@ class MemoryStore:
             return datetime.now().strftime("%Y-%m-%d %H:%M")
 
     def _next_legacy_backup_path(self) -> Path:
-        candidate = self.memory_dir / "HISTORY.md.bak"
+        candidate = self.memory_dir / f"{self.legacy_history_file.name}.bak"
         suffix = 2
         while candidate.exists():
-            candidate = self.memory_dir / f"HISTORY.md.bak.{suffix}"
+            candidate = self.memory_dir / f"{self.legacy_history_file.name}.bak.{suffix}"
             suffix += 1
         return candidate
 

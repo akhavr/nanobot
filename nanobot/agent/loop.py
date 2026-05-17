@@ -18,7 +18,7 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream, MemoryStore
+from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
@@ -39,7 +39,7 @@ from nanobot.session.goal_state import (
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.artifacts import generated_image_paths_from_messages
 from nanobot.utils.document import extract_documents
-from nanobot.utils.helpers import image_placeholder_text, safe_filename
+from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
@@ -271,7 +271,6 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
-        self._memory_stores: dict[str, MemoryStore] = {}
         # Per-session pending queues for mid-turn message injection.
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
@@ -312,24 +311,6 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
-
-    def _memory_store_for_metadata(self, metadata: dict[str, Any] | None = None) -> MemoryStore:
-        """Return the MemoryStore for a turn/session, honoring multi-user isolation."""
-        if not self.multi_user:
-            return self.context.memory
-
-        raw_user_id = metadata.get("user_id") if metadata else None
-        if raw_user_id is None:
-            return self.context.memory
-        user_id = safe_filename(str(raw_user_id).strip())
-        if not user_id:
-            return self.context.memory
-        if user_id not in self._memory_stores:
-            self._memory_stores[user_id] = MemoryStore(self.workspace, user_id=user_id)
-        return self._memory_stores[user_id]
-
-    def _memory_store_for_session(self, session: Session | None) -> MemoryStore:
-        return self._memory_store_for_metadata(session.metadata if session else None)
 
     @classmethod
     def from_config(
@@ -633,7 +614,9 @@ class AgentLoop:
         """Build the initial message list for the LLM turn."""
         # Extract member_count from metadata for privacy-aware context loading
         member_count = msg.metadata.get("member_count") if msg.metadata else None
-        memory_store = self._memory_store_for_session(session)
+        memory_store = self.context.memory_store_for_session_metadata(
+            session.metadata if session else None,
+        )
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -1106,7 +1089,12 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        memory_store = self._memory_store_for_session(session)
+        if msg.metadata and "user_id" in msg.metadata:
+            session.metadata["user_id"] = msg.metadata["user_id"]
+
+        memory_store = self.context.memory_store_for_session_metadata(
+            session.metadata if session else None,
+        )
         await self.consolidator.maybe_consolidate_by_tokens(
             session,
             replay_max_messages=self._max_messages,
@@ -1361,7 +1349,15 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        memory_store = self._memory_store_for_session(ctx.session)
+        # Persist chat-scoped metadata to session.metadata for Dream processing
+        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
+            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
+        if ctx.msg.metadata and "user_id" in ctx.msg.metadata:
+            ctx.session.metadata["user_id"] = ctx.msg.metadata["user_id"]
+
+        memory_store = self.context.memory_store_for_session_metadata(
+            ctx.session.metadata if ctx.session else None,
+        )
         await self.consolidator.maybe_consolidate_by_tokens(
             ctx.session,
             replay_max_messages=self._max_messages,
@@ -1374,12 +1370,6 @@ class AgentLoop:
             ctx.msg.metadata,
             session_key=ctx.session_key,
         )
-
-        # Persist chat-scoped metadata to session.metadata for Dream processing
-        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
-            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
-        if ctx.msg.metadata and "user_id" in ctx.msg.metadata:
-            ctx.session.metadata["user_id"] = ctx.msg.metadata["user_id"]
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1448,7 +1438,9 @@ class AgentLoop:
         )
         if ctx.msg.channel == "websocket":
             self._pending_turn_latency_ms[ctx.session_key] = ctx.turn_latency_ms
-        memory_store = self._memory_store_for_session(ctx.session)
+        memory_store = self.context.memory_store_for_session_metadata(
+            ctx.session.metadata if ctx.session else None,
+        )
         ctx.session.enforce_file_cap(on_archive=memory_store.raw_archive)
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
