@@ -426,24 +426,52 @@ class TelegramChannel(BaseChannel):
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
         self._runtime_groups: set[str] = set(self.config.group_allow_from or [])
 
-    def is_allowed(self, sender_id: str) -> bool:
-        """Preserve Telegram's legacy id|username allowlist matching."""
+    def is_allowed(self, sender_id: str, *, is_dm: bool = False) -> bool:
+        """Preserve Telegram's legacy id|username allowlist matching.
+
+        When is_dm=True and group_allow_all is enabled, also allows users
+        who have been seen in any authorized group.
+        """
         if super().is_allowed(sender_id):
             return True
 
         allow_list = getattr(self.config, "allow_from", [])
-        if not allow_list or "*" in allow_list:
-            return False
 
         sender_str = str(sender_id)
-        if sender_str.count("|") != 1:
-            return False
+        user_id: int | None = None
 
-        sid, username = sender_str.split("|", 1)
-        if not sid.isdigit() or not username:
-            return False
+        if sender_str.count("|") == 1:
+            sid, username = sender_str.split("|", 1)
+            if sid.isdigit() and username:
+                if sid in allow_list or username in allow_list:
+                    return True
+                user_id = int(sid)
+        elif sender_str.isdigit():
+            if sender_str in allow_list:
+                return True
+            user_id = int(sender_str)
 
-        return sid in allow_list or username in allow_list
+        if is_dm and self.config.group_allow_all and user_id is not None:
+            return self._is_user_in_authorized_group(user_id)
+
+        return False
+
+    def _is_user_in_authorized_group(self, user_id: int) -> bool:
+        """Check if user_id exists in any authorized group's member list."""
+        members = load_group_members()
+        for group_id, member_list in members.items():
+            if group_id in self._runtime_groups and user_id in member_list:
+                return True
+        return False
+
+    def _track_group_member(self, group_id: str, user_id: int) -> None:
+        """Add user_id to the group's member list if not already present."""
+        members = load_group_members()
+        if group_id not in members:
+            members[group_id] = []
+        if user_id not in members[group_id]:
+            members[group_id].append(user_id)
+            save_group_members(members)
 
     def is_admin(self, sender_id: str) -> bool:
         """Check if sender is in the admin_users list."""
@@ -1003,9 +1031,17 @@ class TelegramChannel(BaseChannel):
             return
 
         user = update.effective_user
-        if not self.is_allowed(self._sender_id(user)):
+        message = update.message
+        is_dm = message.chat.type == "private"
+        str_chat_id = str(message.chat_id)
+        is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
+
+        if self.config.group_allow_all and is_authorized_group:
+            self._track_group_member(str_chat_id, user.id)
+        elif not self.is_allowed(self._sender_id(user), is_dm=is_dm):
             return
-        await update.message.reply_text(
+
+        await message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
             "Send me a message and I'll respond!\n"
             "Type /help to see available commands."
@@ -1015,9 +1051,18 @@ class TelegramChannel(BaseChannel):
         """Handle /help command for allowed users only."""
         if not update.message or not update.effective_user:
             return
-        if not self.is_allowed(self._sender_id(update.effective_user)):
+        message = update.message
+        user = update.effective_user
+        is_dm = message.chat.type == "private"
+        str_chat_id = str(message.chat_id)
+        is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
+
+        if self.config.group_allow_all and is_authorized_group:
+            self._track_group_member(str_chat_id, user.id)
+        elif not self.is_allowed(self._sender_id(user), is_dm=is_dm):
             return
-        await update.message.reply_text(build_help_text())
+
+        await message.reply_text(build_help_text())
 
     async def _on_addgroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /addgroup command to add a group to the allowlist (admin only)."""
@@ -1392,8 +1437,16 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         sender_id = self._sender_id(user)
-        if not self.is_allowed(sender_id):
+        is_dm = message.chat.type == "private"
+        str_chat_id = str(message.chat_id)
+        is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
+
+        # For groups with group_allow_all and authorized group: skip allowFrom check
+        if self.config.group_allow_all and is_authorized_group:
+            self._track_group_member(str_chat_id, user.id)
+        elif not self.is_allowed(sender_id, is_dm=is_dm):
             return
+
         self._remember_thread_context(message)
 
         # Strip @bot_username suffix if present
@@ -1426,16 +1479,28 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
-        if not self.is_allowed(sender_id):
+        is_dm = message.chat.type == "private"
+        str_chat_id = str(chat_id)
+        is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
+
+        # For groups with group_allow_all and authorized group: skip allowFrom check
+        if self.config.group_allow_all and is_authorized_group:
+            pass  # Allow all users in authorized groups
+        elif not self.is_allowed(sender_id, is_dm=is_dm):
             return
+
         self._remember_thread_context(message)
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
         # Track seen groups for /groups command
-        if message.chat.type != "private":
+        if not is_dm:
             self._track_seen_group(chat_id, getattr(message.chat, "title", None))
+
+        # Track group members when group_allow_all is enabled and in authorized group
+        if self.config.group_allow_all and is_authorized_group:
+            self._track_group_member(str_chat_id, user.id)
 
         if not await self._is_group_message_for_bot(message):
             return
