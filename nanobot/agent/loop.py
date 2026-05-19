@@ -23,6 +23,7 @@ from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.image_generation import ImageGenerationTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
@@ -1257,12 +1258,28 @@ class AgentLoop:
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
 
+        media = self._collect_undelivered_generated_media()
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
+            media=media,
             metadata=meta,
         )
+
+    def _collect_undelivered_generated_media(self) -> list[str]:
+        """Return generated images that weren't delivered via the message tool."""
+        generated: set[str] = set()
+        delivered: set[str] = set()
+        if img_tool := self.tools.get("generate_image"):
+            if isinstance(img_tool, ImageGenerationTool):
+                generated = set(img_tool.turn_generated_media_paths())
+        if msg_tool := self.tools.get("message"):
+            if isinstance(msg_tool, MessageTool):
+                delivered = set(msg_tool.turn_delivered_media_paths())
+        undelivered = generated - delivered
+        return sorted(undelivered)
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
         """Restore checkpoint / pending user turn; extract documents."""
@@ -1343,6 +1360,9 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+        if img_tool := self.tools.get("generate_image"):
+            if isinstance(img_tool, ImageGenerationTool):
+                img_tool.start_turn()
 
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
