@@ -206,9 +206,15 @@ class BaseChannel(ABC):
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         is_dm: bool = False,
+        skip_allowed_check: bool = False,
     ) -> None:
-        """Handle an incoming message: check permissions, issue pairing codes in DMs, or forward to bus."""
-        if not self.is_allowed(sender_id):
+        """Handle an incoming message: check permissions, issue pairing codes in DMs, or forward to bus.
+
+        Args:
+            skip_allowed_check: If True, skip the is_allowed check. Use when the caller
+                has already verified permissions (e.g., group_allow_all in authorized groups).
+        """
+        if not skip_allowed_check and not self.is_allowed(sender_id):
             if is_dm:
                 code = generate_code(self.name, str(sender_id))
                 await self.send(

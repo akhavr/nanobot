@@ -1142,3 +1142,211 @@ class TestChatMemberLeaveKick:
         # No crash, no changes
         members = load_group_members()
         assert members == {}
+
+
+class TestGroupAllowAllHandleMessage:
+    """Tests for groupAllowAll: _handle_message must not double-check permissions.
+
+    When group_allow_all is enabled, users in authorized groups should be able
+    to send messages even if they're not in allow_from. The bug was that
+    _on_message correctly allowed them, but then _handle_message did its own
+    is_allowed check which denied them.
+    """
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel with group_allow_all enabled and an authorized group."""
+        from nanobot.bus.queue import MessageBus
+
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123"],  # Only user 123 in allowFrom
+            group_allow_all=True,
+            group_allow_from=["-100111"],  # Authorized group
+        )
+        bus = MessageBus()
+        channel = TelegramChannel(config, bus)
+        channel._runtime_groups = {"-100111"}
+        channel._app = MagicMock()
+        channel._app.bot = MagicMock()
+        channel._app.bot.get_me = MagicMock(return_value=MagicMock(id=999, username="testbot"))
+        return channel
+
+    def _make_group_message_update(
+        self, chat_id: int, user_id: int, username: str, text: str
+    ) -> MagicMock:
+        """Build a mock Update for a group message."""
+
+        async def mock_get_member_count():
+            return 5
+
+        user = MagicMock()
+        user.id = user_id
+        user.username = username
+        user.first_name = username
+
+        chat = MagicMock()
+        chat.type = "supergroup"
+        chat.id = chat_id
+        chat.title = "Test Group"
+        chat.is_forum = False
+        chat.get_member_count = mock_get_member_count
+
+        message = MagicMock()
+        message.chat = chat
+        message.chat_id = chat_id
+        message.text = text
+        message.caption = None
+        message.entities = []
+        message.caption_entities = []
+        message.reply_to_message = None
+        message.photo = None
+        message.voice = None
+        message.audio = None
+        message.document = None
+        message.video = None
+        message.video_note = None
+        message.animation = None
+        message.location = None
+        message.media_group_id = None
+        message.message_thread_id = None
+        message.message_id = 1
+
+        update = MagicMock()
+        update.message = message
+        update.effective_user = user
+
+        return update
+
+    @pytest.mark.asyncio
+    async def test_non_allowfrom_user_in_authorized_group_message_processed(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Non-allowFrom user in authorized group should have message processed.
+
+        This is the core bug test: user 456 is NOT in allow_from but IS in an
+        authorized group with group_allow_all=True. Their message should be
+        published to the bus, not denied.
+        """
+        # User 456 is not in allow_from
+        update = self._make_group_message_update(
+            chat_id=-100111,  # Authorized group
+            user_id=456,
+            username="MistyForestCat",
+            text="Hello from the group!",
+        )
+
+        # Collect published messages
+        published = []
+        original_publish = channel.bus.publish_inbound
+
+        async def capture_publish(msg):
+            published.append(msg)
+            return await original_publish(msg)
+
+        channel.bus.publish_inbound = capture_publish
+
+        # Mock _is_group_message_for_bot to return True (simulate open policy or @mention)
+        async def mock_is_group_message_for_bot(msg):
+            return True
+        channel._is_group_message_for_bot = mock_is_group_message_for_bot
+
+        await channel._on_message(update, MagicMock())
+
+        # Message should have been published to the bus
+        assert len(published) == 1
+        assert published[0].content == "Hello from the group!"
+        assert published[0].sender_id == "456|MistyForestCat"
+
+    @pytest.mark.asyncio
+    async def test_non_allowfrom_user_in_authorized_group_no_access_denied_log(
+        self, channel: TelegramChannel, state_dir: Path, caplog
+    ) -> None:
+        """Non-allowFrom user in authorized group should NOT trigger 'Access denied' log.
+
+        The bug caused _handle_message to log "Access denied for sender" even
+        when the user was allowed via group_allow_all.
+        """
+        import logging
+
+        update = self._make_group_message_update(
+            chat_id=-100111,  # Authorized group
+            user_id=456,
+            username="MistyForestCat",
+            text="Hello!",
+        )
+
+        async def mock_is_group_message_for_bot(msg):
+            return True
+        channel._is_group_message_for_bot = mock_is_group_message_for_bot
+
+        with caplog.at_level(logging.WARNING):
+            await channel._on_message(update, MagicMock())
+
+        # Should NOT have "Access denied" in any log message
+        access_denied_logs = [
+            r for r in caplog.records
+            if "Access denied" in r.message
+        ]
+        assert access_denied_logs == [], f"Unexpected 'Access denied' log: {access_denied_logs}"
+
+    @pytest.mark.asyncio
+    async def test_allowfrom_user_in_authorized_group_still_works(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Users in allow_from should still work in authorized groups."""
+        update = self._make_group_message_update(
+            chat_id=-100111,
+            user_id=123,  # User 123 IS in allow_from
+            username="admin",
+            text="Admin message",
+        )
+
+        published = []
+        original_publish = channel.bus.publish_inbound
+
+        async def capture_publish(msg):
+            published.append(msg)
+            return await original_publish(msg)
+
+        channel.bus.publish_inbound = capture_publish
+
+        async def mock_is_group_message_for_bot(msg):
+            return True
+        channel._is_group_message_for_bot = mock_is_group_message_for_bot
+
+        await channel._on_message(update, MagicMock())
+
+        assert len(published) == 1
+        assert published[0].sender_id == "123|admin"
+
+    @pytest.mark.asyncio
+    async def test_non_allowfrom_user_in_non_authorized_group_denied(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Non-allowFrom user in non-authorized group should be denied."""
+        update = self._make_group_message_update(
+            chat_id=-100999,  # NOT an authorized group
+            user_id=456,
+            username="MistyForestCat",
+            text="Hello!",
+        )
+
+        published = []
+        original_publish = channel.bus.publish_inbound
+
+        async def capture_publish(msg):
+            published.append(msg)
+            return await original_publish(msg)
+
+        channel.bus.publish_inbound = capture_publish
+
+        async def mock_is_group_message_for_bot(msg):
+            return True
+        channel._is_group_message_for_bot = mock_is_group_message_for_bot
+
+        await channel._on_message(update, MagicMock())
+
+        # Message should NOT be published (denied at _on_message level)
+        assert len(published) == 0
