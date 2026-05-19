@@ -148,9 +148,12 @@ def _make_telegram_update(
     caption_entities=None,
     reply_to_message=None,
     location=None,
+    member_count: int | None = 2,
 ):
     async def mock_get_member_count():
-        return 2
+        if member_count is None:
+            raise Exception("Cannot fetch member count")
+        return member_count
 
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
     chat = SimpleNamespace(
@@ -995,6 +998,130 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
 
     assert len(handled) == 1
     assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_1on1_group_responds_without_mention() -> None:
+    """1:1 group (2 members) with open policy responds to all messages without mention."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # 2 members = 1:1 group, should respond without mention
+    await channel._on_message(_make_telegram_update(text="hello", member_count=2), None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_larger_group_requires_mention() -> None:
+    """Larger group (3+ members) with open policy requires @mention to respond."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # 5 members = larger group, should NOT respond without mention
+    await channel._on_message(_make_telegram_update(text="hello", member_count=5), None)
+
+    assert len(handled) == 0
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_larger_group_responds_with_mention() -> None:
+    """Larger group (3+ members) with open policy responds when @mentioned."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Mention entity for @nanobot_test (the bot username from _FakeBot)
+    entity = SimpleNamespace(type="mention", offset=0, length=13)
+    await channel._on_message(
+        _make_telegram_update(text="@nanobot_test hello", entities=[entity], member_count=5),
+        None,
+    )
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_larger_group_responds_with_reply_to_bot() -> None:
+    """Larger group (3+ members) responds when replying to bot's message."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # Reply to the bot (bot id=999 from _FakeBot)
+    reply = SimpleNamespace(from_user=SimpleNamespace(id=999))
+    await channel._on_message(
+        _make_telegram_update(text="thanks", reply_to_message=reply, member_count=5),
+        None,
+    )
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_policy_open_member_count_unavailable_requires_mention() -> None:
+    """When member_count cannot be fetched, fall back to requiring mention."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    # member_count=None simulates API failure
+    await channel._on_message(_make_telegram_update(text="hello", member_count=None), None)
+
+    # Should NOT respond without mention when member count is unknown (conservative fallback)
+    assert len(handled) == 0
 
 
 @pytest.mark.asyncio
