@@ -6,10 +6,11 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from nanobot.channels.telegram import TelegramConfig
+from nanobot.channels.telegram import TelegramChannel, TelegramConfig
 from nanobot.channels.telegram_state import (
     GroupMembersData,
     GroupOriginsData,
@@ -199,3 +200,198 @@ class TestTelegramConfig:
         data = {"enabled": True, "token": "test:token", "groupAllowAll": True}
         config = TelegramConfig.model_validate(data)
         assert config.group_allow_all is True
+
+
+class TestMyChatMemberHandler:
+    """Tests for my_chat_member event handling (bot add/remove tracking)."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel instance for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123", "allowed_user"],
+        )
+        bus = MagicMock()
+        return TelegramChannel(config, bus)
+
+    def _make_chat_member_update(
+        self,
+        chat_id: int,
+        chat_title: str,
+        from_user_id: int,
+        from_username: str | None,
+        old_status: str,
+        new_status: str,
+    ) -> MagicMock:
+        """Build a mock my_chat_member update."""
+        update = MagicMock()
+        update.my_chat_member = MagicMock()
+        update.my_chat_member.chat = MagicMock()
+        update.my_chat_member.chat.id = chat_id
+        update.my_chat_member.chat.title = chat_title
+        update.my_chat_member.chat.type = "supergroup"
+        update.my_chat_member.from_user = MagicMock()
+        update.my_chat_member.from_user.id = from_user_id
+        update.my_chat_member.from_user.username = from_username
+        update.my_chat_member.old_chat_member = MagicMock()
+        update.my_chat_member.old_chat_member.status = old_status
+        update.my_chat_member.new_chat_member = MagicMock()
+        update.my_chat_member.new_chat_member.status = new_status
+        return update
+
+    @pytest.mark.asyncio
+    async def test_bot_added_by_allowed_user_auto_approved(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Bot added by user in allow_from should be auto-approved."""
+        update = self._make_chat_member_update(
+            chat_id=-100123456,
+            chat_title="Test Group",
+            from_user_id=123,  # In allow_from
+            from_username="other_name",
+            old_status="left",
+            new_status="member",
+        )
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        origins = load_group_origins()
+        assert "-100123456" in origins
+        assert origins["-100123456"]["added_by"] == 123
+        assert origins["-100123456"]["approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_bot_added_by_allowed_username_auto_approved(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Bot added by username in allow_from should be auto-approved."""
+        update = self._make_chat_member_update(
+            chat_id=-100789,
+            chat_title="Test Group 2",
+            from_user_id=999,  # Not in allow_from by ID
+            from_username="allowed_user",  # But username is in allow_from
+            old_status="left",
+            new_status="member",
+        )
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        origins = load_group_origins()
+        assert "-100789" in origins
+        assert origins["-100789"]["added_by"] == 999
+        assert origins["-100789"]["approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_bot_added_by_non_allowed_user_pending(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Bot added by user not in allow_from should be pending approval."""
+        update = self._make_chat_member_update(
+            chat_id=-100999,
+            chat_title="Unknown Group",
+            from_user_id=555,  # Not in allow_from
+            from_username="random_user",
+            old_status="left",
+            new_status="member",
+        )
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        origins = load_group_origins()
+        assert "-100999" in origins
+        assert origins["-100999"]["added_by"] == 555
+        assert origins["-100999"]["approved"] is False
+
+    @pytest.mark.asyncio
+    async def test_bot_removed_cleans_up_origins(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Bot removal should remove group from origins."""
+        # Pre-populate origins
+        save_group_origins({
+            "-100123": {"added_by": 111, "added_at": 1700000000.0, "approved": True}
+        })
+
+        update = self._make_chat_member_update(
+            chat_id=-100123,
+            chat_title="Old Group",
+            from_user_id=111,
+            from_username=None,
+            old_status="member",
+            new_status="left",
+        )
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        origins = load_group_origins()
+        assert "-100123" not in origins
+
+    @pytest.mark.asyncio
+    async def test_bot_removed_cleans_up_members(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Bot removal should remove all members for that group."""
+        # Pre-populate members
+        save_group_members({
+            "-100123": [111, 222, 333],
+            "-100456": [444, 555],
+        })
+
+        update = self._make_chat_member_update(
+            chat_id=-100123,
+            chat_title="Old Group",
+            from_user_id=111,
+            from_username=None,
+            old_status="administrator",
+            new_status="kicked",
+        )
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        members = load_group_members()
+        assert "-100123" not in members
+        # Other group should be untouched
+        assert "-100456" in members
+        assert members["-100456"] == [444, 555]
+
+    @pytest.mark.asyncio
+    async def test_private_chat_ignored(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Private chat updates should be ignored."""
+        update = MagicMock()
+        update.my_chat_member = MagicMock()
+        update.my_chat_member.chat = MagicMock()
+        update.my_chat_member.chat.type = "private"
+
+        await channel._on_my_chat_member(update, MagicMock())
+
+        # Should not have written anything
+        origins = load_group_origins()
+        assert origins == {}
+
+    def test_is_user_in_allow_from_by_id(self, channel: TelegramChannel) -> None:
+        """Check user by ID in allow_from."""
+        assert channel._is_user_in_allow_from(123, None) is True
+        assert channel._is_user_in_allow_from(999, None) is False
+
+    def test_is_user_in_allow_from_by_username(self, channel: TelegramChannel) -> None:
+        """Check user by username in allow_from."""
+        assert channel._is_user_in_allow_from(999, "allowed_user") is True
+        assert channel._is_user_in_allow_from(999, "random_user") is False
+
+    def test_is_user_in_allow_from_wildcard(self) -> None:
+        """Wildcard '*' in allow_from allows everyone."""
+        config = TelegramConfig(enabled=True, token="test:token", allow_from=["*"])
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        assert channel._is_user_in_allow_from(12345, "anyone") is True
+
+    def test_is_user_in_allow_from_empty_list(self) -> None:
+        """Empty allow_from denies everyone."""
+        config = TelegramConfig(enabled=True, token="test:token", allow_from=[])
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        assert channel._is_user_in_allow_from(123, "user") is False
