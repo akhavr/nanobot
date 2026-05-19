@@ -50,6 +50,53 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 nanobot gateway
 ```
 
+### Group Authorization
+
+When the bot is added to a group, nanobot checks whether the person who added it is in `allowFrom`:
+
+- **Auto-approved**: If the adder is in `allowFrom`, the group is immediately authorized. Admin users (see `adminUsers`) receive a notification.
+- **Pending approval**: If the adder is not in `allowFrom`, the group stays pending. All `allowFrom` users receive a DM with **[Approve]** and **[Leave]** buttons.
+
+Use `/addgroup` and `/removegroup` commands (admin only) to manage the group allowlist at runtime.
+
+### Group-Based DM Access (`groupAllowAll`)
+
+Enable `groupAllowAll` to automatically grant DM access to anyone who participates in an authorized group:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "YOUR_BOT_TOKEN",
+      "allowFrom": ["YOUR_USER_ID"],
+      "adminUsers": ["YOUR_USER_ID"],
+      "groupAllowAll": true
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `groupAllowAll` | `false` | When `true`, users seen in any authorized group can also DM the bot directly. |
+| `adminUsers` | `[]` | User IDs that receive admin notifications (group joins, privacy boundary changes). |
+| `groupAllowFrom` | `[]` | Initial group allowlist (chat IDs). Groups can also be added at runtime via `/addgroup`. |
+
+**How it works:**
+
+1. A user sends a message in an authorized group.
+2. nanobot tracks them in `~/.nanobot/state/group_members.json`.
+3. When that user sends a DM, nanobot checks if they belong to any authorized group.
+4. If yes, the DM is allowed — no pairing code needed.
+
+**Revocation:**
+
+When a user leaves or is kicked from a group, they are removed from the member list. If they are not in any other authorized group, their DM access is revoked.
+
+> [!TIP]
+> Combine `groupAllowAll` with [multi-user isolation](./multi-user-isolation.md) for team deployments where each member gets their own private context while sharing the same bot.
+
 </details>
 
 <details>
