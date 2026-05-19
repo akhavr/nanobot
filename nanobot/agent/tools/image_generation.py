@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -101,6 +102,18 @@ class ImageGenerationTool(Tool):
         self.provider_configs = dict(provider_configs or {})
         if provider_config is not None and "openrouter" not in self.provider_configs:
             self.provider_configs["openrouter"] = provider_config
+        self._turn_generated_media_var: ContextVar[tuple[str, ...]] = ContextVar(
+            "image_gen_turn_generated_media",
+            default=(),
+        )
+
+    def start_turn(self) -> None:
+        """Reset per-turn generated media tracking."""
+        self._turn_generated_media_var.set(())
+
+    def turn_generated_media_paths(self) -> list[str]:
+        """Absolute paths of images generated in the current turn."""
+        return list(self._turn_generated_media_var.get())
 
     @property
     def name(self) -> str:
@@ -187,6 +200,7 @@ class ImageGenerationTool(Tool):
         try:
             refs = self._resolve_reference_images(reference_images)
             artifacts: list[dict[str, Any]] = []
+            generated_paths: list[str] = []
             while len(artifacts) < requested:
                 response = await client.generate(
                     prompt=prompt,
@@ -205,8 +219,11 @@ class ImageGenerationTool(Tool):
                         provider=self.config.provider,
                     )
                     artifacts.append(artifact)
+                    generated_paths.append(artifact["path"])
                     if len(artifacts) >= requested:
                         break
+            prev = self._turn_generated_media_var.get()
+            self._turn_generated_media_var.set(prev + tuple(generated_paths))
             return generated_image_tool_result(artifacts)
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return f"Error: {exc}"
