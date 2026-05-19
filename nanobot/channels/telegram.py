@@ -1391,15 +1391,24 @@ class TelegramChannel(BaseChannel):
         return handle in text.lower()
 
     async def _is_group_message_for_bot(self, message) -> bool:
-        """Allow group messages when policy is open, @mentioned, or replying to the bot."""
+        """Allow group messages when policy is open, @mentioned, or replying to the bot.
+
+        When group_policy is "open" and group is in allowed list:
+        - If member_count <= 2 (1:1 chat): respond to all messages
+        - If member_count > 2 (larger group): require @mention or reply to bot
+        - If member_count unavailable: require @mention or reply (conservative fallback)
+        """
         if message.chat.type == "private":
             return True
 
         in_allowed_group = not self._runtime_groups or str(message.chat_id) in self._runtime_groups
 
-        # Fast path: policy is open and group is allowed (no need to check mentions)
+        # Smart open policy: auto-respond only in 1:1 groups (user + bot)
         if self.config.group_policy == "open" and in_allowed_group:
-            return True
+            member_count = await self._get_member_count(message.chat)
+            if member_count is not None and member_count <= 2:
+                return True
+            # Fall through to mention check for larger groups or unknown count
 
         # Check if bot is @mentioned or replied to (always allowed, even from unlisted groups)
         bot_id, bot_username = await self._ensure_bot_identity()
@@ -1425,8 +1434,9 @@ class TelegramChannel(BaseChannel):
         if bot_id and reply_user and reply_user.id == bot_id:
             return True
 
-        # Non-addressed messages: check group_allow_from filter
-        return in_allowed_group and self.config.group_policy == "open"
+        # Non-addressed messages in 1:1 allowed groups with open policy are already handled above.
+        # This final check is for policy="mention" or non-allowed groups.
+        return False
 
     def _remember_thread_context(self, message) -> None:
         """Cache Telegram thread context by chat/message id for follow-up replies."""
