@@ -111,3 +111,68 @@ To migrate from single-user to multi-user:
 | Group chat | SHARED.md only (no user-specific files) |
 
 User A's private data never leaks to User B's context, and vice versa.
+
+## Upgrade Path: Per-User Workspace Directories
+
+The current file-level isolation (`USER_{id}.md`, per-user memory) is suitable for most deployments. For **multi-tenant commercial deployments** requiring hard isolation, a future upgrade path is planned.
+
+### Current: File-Level Isolation
+
+```
+workspace/
+  USER_334424084.md           # User 334424084's profile
+  USER_PRIVATE_334424084.md   # User 334424084's private data
+  USER_987654321.md           # User 987654321's profile
+  USER_PRIVATE_987654321.md   # User 987654321's private data
+  SHARED.md                   # Shared data (unchanged)
+  memory/
+    MEMORY_334424084.md       # User 334424084's long-term memory
+    history_334424084.jsonl   # User 334424084's Dream extractions
+    MEMORY_987654321.md       # User 987654321's long-term memory
+    history_987654321.jsonl   # User 987654321's Dream extractions
+```
+
+**Trade-offs:**
+- All user files share one directory (easy backup, single config)
+- File-system ACLs cannot isolate individual users
+- Suitable for trusted team deployments
+
+### Future: Per-User Workspace Directories
+
+```
+workspace/
+  users/
+    334424084/
+      USER.md
+      USER_PRIVATE.md
+      memory/
+        MEMORY.md
+        history.jsonl
+    987654321/
+      USER.md
+      USER_PRIVATE.md
+      memory/
+        MEMORY.md
+        history.jsonl
+  SHARED.md                   # Still shared across all users
+```
+
+**Benefits:**
+- Each user gets an isolated directory (`workspace/users/{user_id}/`)
+- File-system permissions can enforce hard boundaries
+- Per-user quota enforcement possible
+- Easier per-user backup/export/deletion
+
+### When to Upgrade
+
+Consider upgrading to per-user workspace directories when:
+
+| Scenario | File-Level | Per-User Workspace |
+|----------|------------|-------------------|
+| Single user or small trusted team | ✓ | overkill |
+| Multi-tenant SaaS with billing | — | ✓ |
+| Regulatory requirement for data isolation | — | ✓ |
+| Need per-user filesystem quotas | — | ✓ |
+| Simple ops, single backup path | ✓ | — |
+
+The per-user workspace feature is not yet implemented. If you need it for a commercial deployment, please open an issue describing your use case.
