@@ -1093,6 +1093,10 @@ def agent(
         agent_loop = AgentLoop.from_config(
             config, bus,
             cron_service=cron,
+            image_generation_provider_configs={
+                "openrouter": config.providers.openrouter,
+                "aihubmix": config.providers.aihubmix,
+            },
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
