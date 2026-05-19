@@ -395,3 +395,352 @@ class TestMyChatMemberHandler:
         bus = MagicMock()
         channel = TelegramChannel(config, bus)
         assert channel._is_user_in_allow_from(123, "user") is False
+
+
+class TestGroupApprovalCallbacks:
+    """Tests for inline button approval/leave callbacks."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel instance for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123", "456"],
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._app = MagicMock()
+        return channel
+
+    def _make_callback_query(
+        self,
+        user_id: int,
+        username: str | None,
+        callback_data: str,
+    ) -> tuple[MagicMock, MagicMock]:
+        """Build mock callback query and user."""
+        query = MagicMock()
+        query.data = callback_data
+        query.message = MagicMock()
+        query.message.text = "Test message"
+        query.answer = MagicMock(return_value=None)
+
+        user = MagicMock()
+        user.id = user_id
+        user.username = username
+
+        return query, user
+
+    @pytest.mark.asyncio
+    async def test_approve_callback_sets_approved_true(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Approve button should set approved=True in origins."""
+        # Pre-populate with pending group
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+
+        query, user = self._make_callback_query(
+            user_id=123,  # Authorized user
+            username="admin_user",
+            callback_data="grp_approve:-100123456:123",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        origins = load_group_origins()
+        assert origins["-100123456"]["approved"] is True
+        query.answer.assert_called_with("Group approved!")
+
+    @pytest.mark.asyncio
+    async def test_approve_callback_adds_to_runtime_groups(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Approve button should add group to runtime groups allowlist."""
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+
+        query, user = self._make_callback_query(
+            user_id=123,
+            username="admin",
+            callback_data="grp_approve:-100123456:123",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        assert "-100123456" in channel._runtime_groups
+
+    @pytest.mark.asyncio
+    async def test_leave_callback_removes_from_origins(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Leave button should remove group from origins."""
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+
+        query, user = self._make_callback_query(
+            user_id=456,
+            username="other_admin",
+            callback_data="grp_leave:-100123456:456",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        origins = load_group_origins()
+        assert "-100123456" not in origins
+        query.answer.assert_called_with("Left the group")
+
+    @pytest.mark.asyncio
+    async def test_leave_callback_calls_leave_chat(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Leave button should call bot.leave_chat."""
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+
+        query, user = self._make_callback_query(
+            user_id=123,
+            username="admin",
+            callback_data="grp_leave:-100123456:123",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        channel._app.bot.leave_chat.assert_called_once_with(-100123456)
+
+    @pytest.mark.asyncio
+    async def test_leave_callback_removes_from_members(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Leave button should remove group from members."""
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+        save_group_members({
+            "-100123456": [111, 222],
+            "-100789": [333],
+        })
+
+        query, user = self._make_callback_query(
+            user_id=123,
+            username="admin",
+            callback_data="grp_leave:-100123456:123",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        members = load_group_members()
+        assert "-100123456" not in members
+        assert "-100789" in members
+
+    @pytest.mark.asyncio
+    async def test_callback_rejects_unauthorized_user(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Callback should reject user who is not the authorized recipient."""
+        save_group_origins({
+            "-100123456": {"added_by": 999, "added_at": 1700000000.0, "approved": False}
+        })
+
+        query, user = self._make_callback_query(
+            user_id=789,  # Not the authorized user (123)
+            username="intruder",
+            callback_data="grp_approve:-100123456:123",  # Auth user is 123
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        # Should be rejected
+        query.answer.assert_called_with(
+            "Only the recipient can act on this request", show_alert=True
+        )
+        # Origins should be unchanged
+        origins = load_group_origins()
+        assert origins["-100123456"]["approved"] is False
+
+    @pytest.mark.asyncio
+    async def test_callback_handles_missing_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Callback should handle gracefully if group is no longer in origins."""
+        # Don't create any origins
+
+        query, user = self._make_callback_query(
+            user_id=123,
+            username="admin",
+            callback_data="grp_approve:-100123456:123",
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        query.answer.assert_called_with(
+            "Group not found (may have been removed)", show_alert=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_handles_invalid_data(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Callback should handle malformed callback_data."""
+        query, user = self._make_callback_query(
+            user_id=123,
+            username="admin",
+            callback_data="grp_approve:invalid",  # Missing parts
+        )
+
+        await channel._handle_group_approval_callback(query, user)
+
+        query.answer.assert_called_with("Invalid callback data", show_alert=True)
+
+
+class TestPendingGroupNotification:
+    """Tests for notifying allowFrom users about pending groups."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel instance for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123", "456", "not_numeric"],
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._app = MagicMock()
+        return channel
+
+    @pytest.mark.asyncio
+    async def test_notifies_numeric_allow_from_users(
+        self, channel: TelegramChannel
+    ) -> None:
+        """Should send DM to numeric user IDs in allow_from."""
+
+        async def mock_send(**kwargs):
+            return MagicMock()
+
+        channel._call_with_retry = mock_send
+
+        await channel._notify_allow_from_pending_group(
+            chat_id=-100123456,
+            chat_title="Test Group",
+            adder_display="@random_user",
+        )
+
+        # Should have called send_message for each numeric user ID
+        calls = channel._app.bot.send_message.call_args_list
+        # Note: _call_with_retry wraps send_message, so we check _call_with_retry behavior
+
+    @pytest.mark.asyncio
+    async def test_notification_includes_inline_buttons(
+        self, channel: TelegramChannel
+    ) -> None:
+        """Notification should include Approve and Leave inline buttons."""
+        from telegram import InlineKeyboardMarkup
+
+        sent_messages = []
+
+        async def capture_send(fn, **kwargs):
+            sent_messages.append(kwargs)
+            return MagicMock()
+
+        channel._call_with_retry = capture_send
+
+        await channel._notify_allow_from_pending_group(
+            chat_id=-100999,
+            chat_title="Pending Group",
+            adder_display="@someone",
+        )
+
+        # Should have sent to both numeric users (123 and 456)
+        assert len(sent_messages) == 2
+
+        # Each message should have reply_markup with buttons
+        for msg in sent_messages:
+            assert "reply_markup" in msg
+            markup = msg["reply_markup"]
+            assert isinstance(markup, InlineKeyboardMarkup)
+            # Should have one row with two buttons
+            assert len(markup.inline_keyboard) == 1
+            assert len(markup.inline_keyboard[0]) == 2
+            buttons = markup.inline_keyboard[0]
+            assert buttons[0].text == "Approve"
+            assert buttons[1].text == "Leave"
+
+    @pytest.mark.asyncio
+    async def test_buttons_encode_authorized_user(
+        self, channel: TelegramChannel
+    ) -> None:
+        """Button callback_data should include the authorized user ID."""
+        from telegram import InlineKeyboardMarkup
+
+        sent_messages = []
+
+        async def capture_send(fn, **kwargs):
+            sent_messages.append(kwargs)
+            return MagicMock()
+
+        channel._call_with_retry = capture_send
+
+        await channel._notify_allow_from_pending_group(
+            chat_id=-100999,
+            chat_title="Group",
+            adder_display="@user",
+        )
+
+        # Check each message has correct auth user in callback_data
+        for msg in sent_messages:
+            recipient = msg["chat_id"]
+            markup = msg["reply_markup"]
+            approve_btn = markup.inline_keyboard[0][0]
+            leave_btn = markup.inline_keyboard[0][1]
+
+            # Format: grp_approve:<group_id>:<auth_user_id>
+            assert approve_btn.callback_data == f"grp_approve:-100999:{recipient}"
+            assert leave_btn.callback_data == f"grp_leave:-100999:{recipient}"
+
+    @pytest.mark.asyncio
+    async def test_skips_wildcard_allow_from(self, state_dir: Path) -> None:
+        """Should skip notification when allow_from is wildcard."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["*"],
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._app = MagicMock()
+
+        await channel._notify_allow_from_pending_group(
+            chat_id=-100999,
+            chat_title="Group",
+            adder_display="@user",
+        )
+
+        # Should not have called send_message
+        channel._app.bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_allow_from(self, state_dir: Path) -> None:
+        """Should skip notification when allow_from is empty."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=[],
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._app = MagicMock()
+
+        await channel._notify_allow_from_pending_group(
+            chat_id=-100999,
+            chat_title="Group",
+            adder_display="@user",
+        )
+
+        # Should not have called send_message
+        channel._app.bot.send_message.assert_not_called()

@@ -593,13 +593,11 @@ class TelegramChannel(BaseChannel):
         # Handler for other users joining/leaving groups (for privacy boundary detection)
         self._app.add_handler(ChatMemberHandler(self._on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-        # Conditionally register inline keyboard callback handler
+        # Always register callback handler for group approval buttons (and optionally user keyboards)
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
+        allowed_updates = ["message", "callback_query", "my_chat_member", "chat_member"]
         if self.config.inline_keyboards:
-            self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "callback_query", "my_chat_member", "chat_member"]
             self.logger.debug("inline keyboards enabled")
-        else:
-            allowed_updates = ["message", "my_chat_member", "chat_member"]
 
         self.logger.info("Starting bot (polling mode)...")
 
@@ -1674,12 +1672,19 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = query.message.chat_id if query.message else None
         sender_id = self._sender_id(user)
+        callback_data = query.data or ""
+
+        # Handle group approval callbacks (format: "grp_approve:<group_id>:<auth_user_id>" or "grp_leave:...")
+        if callback_data.startswith("grp_approve:") or callback_data.startswith("grp_leave:"):
+            await self._handle_group_approval_callback(query, user)
+            return
+
         if not chat_id:
             self.logger.warning("Callback query without chat_id")
             return
         if not self.is_allowed(sender_id):
             return
-        button_label = query.data or ""
+        button_label = callback_data
         await query.answer()
         if query.message:
             with suppress(Exception):
@@ -1699,6 +1704,86 @@ class TelegramChannel(BaseChannel):
                 "is_callback": True,
             },
         )
+
+    async def _handle_group_approval_callback(self, query, user) -> None:
+        """Handle [Approve] or [Leave] button clicks for pending group approval."""
+        callback_data = query.data or ""
+        parts = callback_data.split(":")
+        if len(parts) != 3:
+            await query.answer("Invalid callback data", show_alert=True)
+            return
+
+        action, group_id_str, auth_user_id_str = parts
+
+        # Verify the clicking user is the authorized recipient
+        if str(user.id) != auth_user_id_str:
+            await query.answer("Only the recipient can act on this request", show_alert=True)
+            return
+
+        # Load origins to check if group is still pending
+        origins = load_group_origins()
+        if group_id_str not in origins:
+            await query.answer("Group not found (may have been removed)", show_alert=True)
+            if query.message:
+                with suppress(Exception):
+                    await query.message.edit_reply_markup(reply_markup=None)
+            return
+
+        origin = origins[group_id_str]
+
+        if action == "grp_approve":
+            # Approve the group
+            origin["approved"] = True
+            origins[group_id_str] = origin
+            save_group_origins(origins)
+
+            # Also add to runtime groups allowlist
+            if group_id_str not in self._runtime_groups:
+                persisted = _load_persisted_groups()
+                if group_id_str not in persisted:
+                    persisted.append(group_id_str)
+                    _save_persisted_groups(persisted)
+                self._runtime_groups.add(group_id_str)
+
+            await query.answer("Group approved!")
+            self.logger.info("User {} approved group {}", user.id, group_id_str)
+            if query.message:
+                with suppress(Exception):
+                    await query.message.edit_text(
+                        f"{query.message.text}\n\n✅ Approved by @{user.username or user.id}"
+                    )
+
+        elif action == "grp_leave":
+            # Leave the group and clean up
+            try:
+                await self._app.bot.leave_chat(int(group_id_str))
+                self.logger.info("Left group {} on request from user {}", group_id_str, user.id)
+            except Exception as e:
+                self.logger.warning("Failed to leave group {}: {}", group_id_str, e)
+
+            # Remove from group_origins
+            del origins[group_id_str]
+            save_group_origins(origins)
+
+            # Remove from group_members
+            members = load_group_members()
+            if group_id_str in members:
+                del members[group_id_str]
+                save_group_members(members)
+
+            # Remove from runtime groups if present
+            self._runtime_groups.discard(group_id_str)
+            persisted = _load_persisted_groups()
+            if group_id_str in persisted:
+                persisted.remove(group_id_str)
+                _save_persisted_groups(persisted)
+
+            await query.answer("Left the group")
+            if query.message:
+                with suppress(Exception):
+                    await query.message.edit_text(
+                        f"{query.message.text}\n\n❌ Left by request from @{user.username or user.id}"
+                    )
 
     def _is_user_in_allow_from(self, user_id: int, username: str | None) -> bool:
         """Check if a user_id or username is in the allow_from list."""
@@ -1757,10 +1842,13 @@ class TelegramChannel(BaseChannel):
 
             if is_approved:
                 self.logger.info("Group {} auto-approved (adder {} in allowFrom)", chat_id, adder_id)
+                # Notify admins about auto-approved group
+                await self._notify_admins_group_join(chat_id, chat_title)
             else:
                 self.logger.info("Group {} pending approval (adder {} not in allowFrom)", chat_id, adder_id)
-
-            await self._notify_admins_group_join(chat_id, chat_title)
+                # Notify allowFrom users with approval buttons
+                adder_display = f"@{adder_username}" if adder_username else f"user {adder_id}"
+                await self._notify_allow_from_pending_group(chat_id, chat_title, adder_display)
 
         elif was_member and not is_member:
             # Bot was removed from a group
@@ -1781,7 +1869,7 @@ class TelegramChannel(BaseChannel):
                 self.logger.debug("Removed members for group {}", chat_id)
 
     async def _notify_admins_group_join(self, chat_id: int, chat_title: str) -> None:
-        """Send DM to all configured admins when bot joins a new group."""
+        """Send DM to all configured admins when bot joins a new group (auto-approved)."""
         if not self._app:
             return
 
@@ -1805,6 +1893,55 @@ class TelegramChannel(BaseChannel):
                 self.logger.debug("Notified admin {} about group join", admin_id)
             except Exception as e:
                 self.logger.warning("Failed to notify admin {}: {}", admin_id, e)
+
+    async def _notify_allow_from_pending_group(
+        self, chat_id: int, chat_title: str, adder_display: str
+    ) -> None:
+        """DM all allowFrom users with approval buttons when a pending group is added."""
+        if not self._app:
+            return
+
+        allow_from = self.config.allow_from
+        if not allow_from:
+            self.logger.debug("No allow_from configured, skipping pending group notification")
+            return
+
+        # Skip wildcard allowFrom
+        if "*" in allow_from:
+            self.logger.debug("allow_from is wildcard, skipping pending group notification")
+            return
+
+        message = f"{adder_display} added me to group '{chat_title}'."
+
+        for user_id_or_name in allow_from:
+            # Only notify numeric user IDs (we can't DM by username)
+            if not user_id_or_name.lstrip("-").isdigit():
+                self.logger.debug("Skipping non-numeric allowFrom entry: {}", user_id_or_name)
+                continue
+
+            user_id = int(user_id_or_name)
+            # Build callback data with authorized user ID for security
+            # Format: action:group_id:authorized_user_id
+            approve_data = f"grp_approve:{chat_id}:{user_id}"
+            leave_data = f"grp_leave:{chat_id}:{user_id}"
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Approve", callback_data=approve_data),
+                    InlineKeyboardButton("Leave", callback_data=leave_data),
+                ]
+            ])
+
+            try:
+                await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=keyboard,
+                )
+                self.logger.debug("Notified allowFrom user {} about pending group {}", user_id, chat_id)
+            except Exception as e:
+                self.logger.warning("Failed to notify allowFrom user {}: {}", user_id, e)
 
     async def _on_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle other users joining/leaving a group (privacy boundary detection).
