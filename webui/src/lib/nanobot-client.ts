@@ -54,7 +54,9 @@ type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
 type RuntimeModelHandler = (modelName: string | null, modelPreset?: string | null) => void;
-type SessionUpdateHandler = (chatId: string) => void;
+type SessionUpdateScope = "metadata" | "thread" | string;
+type SessionUpdateHandler = (chatId: string, scope?: SessionUpdateScope) => void;
+type RunStatusHandler = (chatId: string, startedAt: number | null) => void;
 
 /** Structured connection-level errors surfaced to the UI.
  *
@@ -101,6 +103,7 @@ export class NanobotClient {
   private statusHandlers = new Set<StatusHandler>();
   private runtimeModelHandlers = new Set<RuntimeModelHandler>();
   private sessionUpdateHandlers = new Set<SessionUpdateHandler>();
+  private runStatusHandlers = new Set<RunStatusHandler>();
   private errorHandlers = new Set<ErrorHandler>();
   // chat_id -> handlers listening on it
   private chatHandlers = new Map<string, Set<EventHandler>>();
@@ -171,6 +174,16 @@ export class NanobotClient {
     };
   }
 
+  onRunStatus(handler: RunStatusHandler): Unsubscribe {
+    this.runStatusHandlers.add(handler);
+    for (const [chatId, startedAt] of this.runStartedAtByChatId) {
+      handler(chatId, startedAt);
+    }
+    return () => {
+      this.runStatusHandlers.delete(handler);
+    };
+  }
+
   /** Subscribe to transport-level faults (see :type:`StreamError`). */
   onError(handler: ErrorHandler): Unsubscribe {
     this.errorHandlers.add(handler);
@@ -193,9 +206,12 @@ export class NanobotClient {
   private recordGoalStatusForRunStrip(chatId: string, ev: InboundEvent): void {
     if (ev.event !== "goal_status") return;
     if (ev.status === "running" && typeof ev.started_at === "number") {
+      const previous = this.runStartedAtByChatId.get(chatId);
       this.runStartedAtByChatId.set(chatId, ev.started_at);
-    } else {
+      if (previous !== ev.started_at) this.emitRunStatus(chatId, ev.started_at);
+    } else if (this.runStartedAtByChatId.has(chatId)) {
       this.runStartedAtByChatId.delete(chatId);
+      this.emitRunStatus(chatId, null);
     }
   }
 
@@ -364,7 +380,7 @@ export class NanobotClient {
     }
 
     if (parsed.event === "session_updated") {
-      this.emitSessionUpdate(parsed.chat_id);
+      this.emitSessionUpdate(parsed.chat_id, parsed.scope);
       return;
     }
 
@@ -382,9 +398,15 @@ export class NanobotClient {
     }
   }
 
-  private emitSessionUpdate(chatId: string): void {
+  private emitSessionUpdate(chatId: string, scope?: SessionUpdateScope): void {
     for (const handler of this.sessionUpdateHandlers) {
-      handler(chatId);
+      handler(chatId, scope);
+    }
+  }
+
+  private emitRunStatus(chatId: string, startedAt: number | null): void {
+    for (const handler of this.runStatusHandlers) {
+      handler(chatId, startedAt);
     }
   }
 
