@@ -744,3 +744,185 @@ class TestPendingGroupNotification:
 
         # Should not have called send_message
         channel._app.bot.send_message.assert_not_called()
+
+
+class TestGroupAllowAllDmAccess:
+    """Tests for group_allow_all DM access via group membership."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel with group_allow_all enabled."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123"],  # Only user 123 in allowFrom
+            group_allow_all=True,
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._runtime_groups = {"-100111", "-100222"}  # Two authorized groups
+        return channel
+
+    def test_is_allowed_dm_user_in_authorized_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User in authorized group's member list should be allowed DM access."""
+        save_group_members({
+            "-100111": [456, 789],
+            "-100222": [111],
+        })
+
+        # User 456 is in group -100111 (authorized), should be allowed DM
+        assert channel.is_allowed("456|someone", is_dm=True) is True
+
+    def test_is_allowed_dm_user_not_in_authorized_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User not in any authorized group should be denied DM access."""
+        save_group_members({
+            "-100111": [456],
+            "-100333": [999],  # This group is NOT in _runtime_groups
+        })
+
+        # User 999 is only in non-authorized group -100333, should be denied
+        assert channel.is_allowed("999|random", is_dm=True) is False
+
+    def test_is_allowed_dm_user_in_allowfrom_always_allowed(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User in allowFrom should always be allowed, regardless of group membership."""
+        assert channel.is_allowed("123|admin", is_dm=True) is True
+
+    def test_is_allowed_dm_checks_only_authorized_groups(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """DM access should only check authorized groups in _runtime_groups."""
+        save_group_members({
+            "-100333": [555],  # User 555 in non-authorized group
+        })
+
+        assert channel.is_allowed("555|user", is_dm=True) is False
+
+    def test_is_allowed_non_dm_ignores_group_membership(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Non-DM (group message) should not use group membership for access."""
+        save_group_members({"-100111": [456]})
+
+        # User 456 is in authorized group, but is_dm=False should not grant access
+        assert channel.is_allowed("456|someone", is_dm=False) is False
+
+    def test_is_allowed_group_allow_all_disabled_ignores_membership(
+        self, state_dir: Path
+    ) -> None:
+        """When group_allow_all is disabled, group membership is not checked."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            allow_from=["123"],
+            group_allow_all=False,  # Disabled
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._runtime_groups = {"-100111"}
+
+        save_group_members({"-100111": [456]})
+
+        # Even though user 456 is in authorized group, group_allow_all is disabled
+        assert channel.is_allowed("456|someone", is_dm=True) is False
+
+
+class TestTrackGroupMember:
+    """Tests for _track_group_member functionality."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            group_allow_all=True,
+        )
+        bus = MagicMock()
+        return TelegramChannel(config, bus)
+
+    def test_track_adds_new_user_to_new_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should create group and add user when group doesn't exist."""
+        channel._track_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert "-100111" in members
+        assert 456 in members["-100111"]
+
+    def test_track_adds_new_user_to_existing_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should add user to existing group's member list."""
+        save_group_members({"-100111": [123]})
+
+        channel._track_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert 123 in members["-100111"]
+        assert 456 in members["-100111"]
+
+    def test_track_does_not_duplicate_user(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should not add duplicate user_id to group."""
+        save_group_members({"-100111": [456]})
+
+        channel._track_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert members["-100111"].count(456) == 1
+
+
+class TestIsUserInAuthorizedGroup:
+    """Tests for _is_user_in_authorized_group functionality."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._runtime_groups = {"-100111", "-100222"}
+        return channel
+
+    def test_user_found_in_authorized_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should return True when user is in an authorized group."""
+        save_group_members({"-100111": [456, 789]})
+
+        assert channel._is_user_in_authorized_group(456) is True
+
+    def test_user_not_found_in_any_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should return False when user is not in any group."""
+        save_group_members({"-100111": [456]})
+
+        assert channel._is_user_in_authorized_group(999) is False
+
+    def test_user_in_unauthorized_group_only(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should return False when user is only in non-authorized groups."""
+        save_group_members({
+            "-100333": [456],  # Not in _runtime_groups
+        })
+
+        assert channel._is_user_in_authorized_group(456) is False
+
+    def test_empty_members_file(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should return False when members file is empty."""
+        assert channel._is_user_in_authorized_group(456) is False
