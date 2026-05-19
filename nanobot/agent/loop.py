@@ -60,6 +60,26 @@ if TYPE_CHECKING:
 UNIFIED_SESSION_KEY = "unified:default"
 
 
+def _sync_privacy_metadata(
+    session_metadata: dict[str, Any],
+    msg_metadata: dict[str, Any] | None,
+) -> None:
+    """Sync member_count and user_id from message to session, respecting privacy.
+
+    Privacy rule: user_id is only persisted in DMs (member_count absent or <= 2).
+    In group chats (member_count > 2), user_id is cleared to prevent leaking
+    user-specific data to shared group sessions.
+    """
+    if msg_metadata and "member_count" in msg_metadata:
+        session_metadata["member_count"] = msg_metadata["member_count"]
+    member_count = msg_metadata.get("member_count") if msg_metadata else None
+    is_group_chat = member_count is not None and member_count > 2
+    if is_group_chat:
+        session_metadata.pop("user_id", None)
+    elif msg_metadata and "user_id" in msg_metadata:
+        session_metadata["user_id"] = msg_metadata["user_id"]
+
+
 class TurnState(Enum):
     RESTORE = auto()
     COMPACT = auto()
@@ -1049,16 +1069,7 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        # Persist member_count if available
-        if msg.metadata and "member_count" in msg.metadata:
-            session.metadata["member_count"] = msg.metadata["member_count"]
-        # Privacy: only persist user_id in DMs (member_count absent or <= 2)
-        member_count = msg.metadata.get("member_count") if msg.metadata else None
-        is_group_chat = member_count is not None and member_count > 2
-        if is_group_chat:
-            session.metadata.pop("user_id", None)
-        elif msg.metadata and "user_id" in msg.metadata:
-            session.metadata["user_id"] = msg.metadata["user_id"]
+        _sync_privacy_metadata(session.metadata, msg.metadata)
 
         memory_store = self.context.memory_store_for_session_metadata(
             session.metadata if session else None,
@@ -1271,16 +1282,7 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         mark_webui_session(ctx.session, msg.metadata)
 
-        # Persist chat-scoped metadata to session metadata for Dream processing
-        if msg.metadata and "member_count" in msg.metadata:
-            ctx.session.metadata["member_count"] = msg.metadata["member_count"]
-        # Privacy: only persist user_id in DMs (member_count absent or <= 2)
-        member_count = msg.metadata.get("member_count") if msg.metadata else None
-        is_group_chat = member_count is not None and member_count > 2
-        if is_group_chat:
-            ctx.session.metadata.pop("user_id", None)
-        elif msg.metadata and "user_id" in msg.metadata:
-            ctx.session.metadata["user_id"] = msg.metadata["user_id"]
+        _sync_privacy_metadata(ctx.session.metadata, msg.metadata)
 
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
@@ -1320,16 +1322,7 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        # Persist chat-scoped metadata to session.metadata for Dream processing
-        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
-            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
-        # Privacy: only persist user_id in DMs (member_count absent or <= 2)
-        member_count = ctx.msg.metadata.get("member_count") if ctx.msg.metadata else None
-        is_group_chat = member_count is not None and member_count > 2
-        if is_group_chat:
-            ctx.session.metadata.pop("user_id", None)
-        elif ctx.msg.metadata and "user_id" in ctx.msg.metadata:
-            ctx.session.metadata["user_id"] = ctx.msg.metadata["user_id"]
+        _sync_privacy_metadata(ctx.session.metadata, ctx.msg.metadata)
 
         memory_store = self.context.memory_store_for_session_metadata(
             ctx.session.metadata if ctx.session else None,

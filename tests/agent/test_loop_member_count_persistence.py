@@ -359,3 +359,105 @@ async def test_state_build_skips_user_id_in_group_chat(tmp_path, mock_provider):
     assert session.metadata.get("member_count") == 5
     # user_id should NOT be persisted in group chats
     assert "user_id" not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_process_system_message_persists_user_id_in_dm(tmp_path, mock_provider):
+    """Verify user_id is persisted in _process_system_message for DMs."""
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="subagent",
+        chat_id="telegram:-100123456",
+        content="Subagent result",
+        metadata={"user_id": "alice", "member_count": 2},
+    )
+
+    await loop._process_system_message(msg)
+
+    session = loop.sessions.get("telegram:-100123456")
+    assert session is not None
+    assert session.metadata.get("user_id") == "alice"
+    assert session.metadata.get("member_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_process_system_message_skips_user_id_in_group_chat(tmp_path, mock_provider):
+    """Privacy: user_id must NOT be persisted in _process_system_message for groups."""
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="subagent",
+        chat_id="telegram:-100123456",
+        content="Subagent result",
+        metadata={"user_id": "alice", "member_count": 5},
+    )
+
+    await loop._process_system_message(msg)
+
+    session = loop.sessions.get("telegram:-100123456")
+    assert session is not None
+    assert session.metadata.get("member_count") == 5
+    assert "user_id" not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_process_system_message_clears_user_id_when_chat_becomes_group(
+    tmp_path, mock_provider
+):
+    """Privacy: user_id is cleared in _process_system_message when chat becomes group."""
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    # Pre-populate session with user_id from when it was a DM
+    session = loop.sessions.get_or_create("telegram:-100123456")
+    session.metadata["user_id"] = "old-user"
+    session.metadata["member_count"] = 2
+    loop.sessions.save(session)
+
+    # Now receive a message indicating it's now a group
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="subagent",
+        chat_id="telegram:-100123456",
+        content="Subagent result",
+        metadata={"user_id": "alice", "member_count": 3},
+    )
+
+    await loop._process_system_message(msg)
+
+    session = loop.sessions.get("telegram:-100123456")
+    assert session is not None
+    assert session.metadata.get("member_count") == 3
+    assert "user_id" not in session.metadata
