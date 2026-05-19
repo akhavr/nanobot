@@ -145,14 +145,14 @@ async def test_state_restore_updates_member_count_when_changed(agent_loop):
 
 
 @pytest.mark.asyncio
-async def test_state_restore_persists_user_id_to_session_metadata(agent_loop):
-    """Verify user_id from msg.metadata is persisted to session.metadata."""
+async def test_state_restore_persists_user_id_in_dm(agent_loop):
+    """Verify user_id is persisted in direct messages (member_count=2)."""
     msg = InboundMessage(
         channel="telegram",
         sender_id="user123",
         chat_id="-100123456",
         content="Hello",
-        metadata={"user_id": "user123"},
+        metadata={"user_id": "user123", "member_count": 2},
     )
 
     session = agent_loop.sessions.get_or_create("telegram:-100123456")
@@ -170,17 +170,73 @@ async def test_state_restore_persists_user_id_to_session_metadata(agent_loop):
 
 
 @pytest.mark.asyncio
-async def test_state_restore_updates_user_id_when_changed(agent_loop):
-    """Verify user_id is updated when the sender changes."""
-    session = agent_loop.sessions.get_or_create("telegram:-100999")
-    session.metadata["user_id"] = "old-user"
+async def test_state_restore_persists_user_id_without_member_count(agent_loop):
+    """Verify user_id is persisted when member_count is not available (e.g., CLI)."""
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="user123",
+        chat_id="direct",
+        content="Hello",
+        metadata={"user_id": "user123"},
+    )
 
+    session = agent_loop.sessions.get_or_create("cli:direct")
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="cli:direct",
+        state=TurnState.RESTORE,
+        turn_id="test-turn-5b",
+    )
+
+    await agent_loop._state_restore(ctx)
+
+    assert session.metadata.get("user_id") == "user123"
+
+
+@pytest.mark.asyncio
+async def test_state_restore_skips_user_id_in_group_chat(agent_loop):
+    """Privacy: user_id must NOT be persisted in group chats (member_count > 2)."""
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="user123",
+        chat_id="-100123456",
+        content="Hello group",
+        metadata={"user_id": "user123", "member_count": 5},
+    )
+
+    session = agent_loop.sessions.get_or_create("telegram:-100123456")
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="telegram:-100123456",
+        state=TurnState.RESTORE,
+        turn_id="test-turn-privacy-1",
+    )
+
+    await agent_loop._state_restore(ctx)
+
+    # member_count should be persisted
+    assert session.metadata.get("member_count") == 5
+    # user_id should NOT be persisted in group chats
+    assert "user_id" not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_state_restore_clears_user_id_when_chat_becomes_group(agent_loop):
+    """Privacy: user_id should be cleared when member_count exceeds 2."""
+    session = agent_loop.sessions.get_or_create("telegram:-100999")
+    # Previously was a DM with user_id stored
+    session.metadata["user_id"] = "old-user"
+    session.metadata["member_count"] = 2
+
+    # Now chat has become a group
     msg = InboundMessage(
         channel="telegram",
         sender_id="user456",
         chat_id="-100999",
-        content="New message",
-        metadata={"user_id": "user456"},
+        content="New member joined",
+        metadata={"user_id": "user456", "member_count": 3},
     )
 
     ctx = TurnContext(
@@ -188,12 +244,15 @@ async def test_state_restore_updates_user_id_when_changed(agent_loop):
         session=session,
         session_key="telegram:-100999",
         state=TurnState.RESTORE,
-        turn_id="test-turn-6",
+        turn_id="test-turn-privacy-2",
     )
 
     await agent_loop._state_restore(ctx)
 
-    assert session.metadata.get("user_id") == "user456"
+    # member_count updated
+    assert session.metadata.get("member_count") == 3
+    # user_id should be cleared (chat is now a group)
+    assert "user_id" not in session.metadata
 
 
 @pytest.mark.asyncio
@@ -218,7 +277,8 @@ async def test_multi_user_session_uses_user_specific_memory_store(tmp_path, mock
 
 
 @pytest.mark.asyncio
-async def test_state_build_persists_user_id_before_memory_lookup(tmp_path, mock_provider):
+async def test_state_build_persists_user_id_in_dm(tmp_path, mock_provider):
+    """Verify user_id is persisted in _state_build for DMs (member_count=2)."""
     with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
         mock_sub_mgr.return_value.cancel_by_session = MagicMock()
         loop = AgentLoop(
@@ -235,7 +295,7 @@ async def test_state_build_persists_user_id_before_memory_lookup(tmp_path, mock_
         sender_id="user123",
         chat_id="-100123456",
         content="Hello",
-        metadata={"user_id": "alice"},
+        metadata={"user_id": "alice", "member_count": 2},
     )
     ctx = TurnContext(
         msg=msg,
@@ -260,3 +320,42 @@ async def test_state_build_persists_user_id_before_memory_lookup(tmp_path, mock_
     assert observed_user_ids
     assert set(observed_user_ids) == {"alice"}
     assert session.metadata.get("user_id") == "alice"
+
+
+@pytest.mark.asyncio
+async def test_state_build_skips_user_id_in_group_chat(tmp_path, mock_provider):
+    """Privacy: user_id must NOT be persisted in _state_build for group chats."""
+    with patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = MagicMock()
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=mock_provider,
+            workspace=tmp_path,
+            multi_user=True,
+        )
+
+    loop.context.memory = MemoryStore(tmp_path)
+    session = loop.sessions.get_or_create("telegram:-100123456")
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="user123",
+        chat_id="-100123456",
+        content="Hello group",
+        metadata={"user_id": "alice", "member_count": 5},
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session=session,
+        session_key="telegram:-100123456",
+        state=TurnState.BUILD,
+        turn_id="test-turn-privacy-build",
+    )
+
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+
+    await loop._state_build(ctx)
+
+    # member_count should be persisted
+    assert session.metadata.get("member_count") == 5
+    # user_id should NOT be persisted in group chats
+    assert "user_id" not in session.metadata
