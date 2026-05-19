@@ -361,6 +361,7 @@ class TelegramConfig(Base):
     inline_keyboards: bool = False
     stream_edit_interval: float = Field(default=_STREAM_EDIT_INTERVAL_DEFAULT, ge=0.1)
     admin_users: list[str] = Field(default_factory=list)
+    group_allow_all: bool = False
 
 
 class TelegramChannel(BaseChannel):
