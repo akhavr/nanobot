@@ -1450,7 +1450,8 @@ class TelegramChannel(BaseChannel):
         is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
 
         # For groups with group_allow_all and authorized group: skip allowFrom check
-        if self.config.group_allow_all and is_authorized_group:
+        skip_allowed_check = self.config.group_allow_all and is_authorized_group
+        if skip_allowed_check:
             self._track_group_member(str_chat_id, user.id)
         elif not self.is_allowed(sender_id, is_dm=is_dm):
             return
@@ -1476,6 +1477,7 @@ class TelegramChannel(BaseChannel):
             metadata=metadata,
             session_key=self._derive_topic_session_key(message),
             is_dm=message.chat.type == "private",
+            skip_allowed_check=skip_allowed_check,
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1492,8 +1494,9 @@ class TelegramChannel(BaseChannel):
         is_authorized_group = not is_dm and str_chat_id in self._runtime_groups
 
         # For groups with group_allow_all and authorized group: skip allowFrom check
-        if self.config.group_allow_all and is_authorized_group:
-            pass  # Allow all users in authorized groups
+        skip_allowed_check = self.config.group_allow_all and is_authorized_group
+        if skip_allowed_check:
+            self._track_group_member(str_chat_id, user.id)
         elif not self.is_allowed(sender_id, is_dm=is_dm):
             return
 
@@ -1505,10 +1508,6 @@ class TelegramChannel(BaseChannel):
         # Track seen groups for /groups command
         if not is_dm:
             self._track_seen_group(chat_id, getattr(message.chat, "title", None))
-
-        # Track group members when group_allow_all is enabled and in authorized group
-        if self.config.group_allow_all and is_authorized_group:
-            self._track_group_member(str_chat_id, user.id)
 
         if not await self._is_group_message_for_bot(message):
             return
@@ -1567,6 +1566,7 @@ class TelegramChannel(BaseChannel):
                     "contents": [], "media": [],
                     "metadata": metadata,
                     "session_key": session_key,
+                    "skip_allowed_check": skip_allowed_check,
                 }
                 self._start_typing(str_chat_id)
                 await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
@@ -1590,6 +1590,7 @@ class TelegramChannel(BaseChannel):
             media=media_paths,
             metadata=metadata,
             session_key=session_key,
+            skip_allowed_check=skip_allowed_check,
         )
 
     async def _flush_media_group(self, key: str) -> None:
@@ -1604,6 +1605,7 @@ class TelegramChannel(BaseChannel):
                 content=content, media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
                 session_key=buf.get("session_key"),
+                skip_allowed_check=buf.get("skip_allowed_check", False),
             )
         finally:
             self._media_group_tasks.pop(key, None)
