@@ -33,19 +33,20 @@ from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.goal_state import (
-    goal_state_ws_blob,
     runner_wall_llm_timeout_s,
 )
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.artifacts import generated_image_paths_from_messages
+from nanobot.session.webui_turns import (
+    WebuiTurnCoordinator,
+    build_bus_progress_callback,
+    mark_webui_session,
+)
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
+from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
-from nanobot.utils.session_attachments import merge_turn_media_into_last_assistant
-from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
-from nanobot.utils.webui_turn_helpers import publish_turn_run_status
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -57,6 +58,26 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
+
+
+def _sync_privacy_metadata(
+    session_metadata: dict[str, Any],
+    msg_metadata: dict[str, Any] | None,
+) -> None:
+    """Sync member_count and user_id from message to session, respecting privacy.
+
+    Privacy rule: user_id is only persisted in DMs (member_count absent or <= 2).
+    In group chats (member_count > 2), user_id is cleared to prevent leaking
+    user-specific data to shared group sessions.
+    """
+    if msg_metadata and "member_count" in msg_metadata:
+        session_metadata["member_count"] = msg_metadata["member_count"]
+    member_count = msg_metadata.get("member_count") if msg_metadata else None
+    is_group_chat = member_count is not None and member_count > 2
+    if is_group_chat:
+        session_metadata.pop("user_id", None)
+    elif msg_metadata and "user_id" in msg_metadata:
+        session_metadata["user_id"] = msg_metadata["user_id"]
 
 
 class TurnState(Enum):
@@ -100,7 +121,6 @@ class TurnContext:
     save_skip: int = 0
 
     outbound: OutboundMessage | None = None
-    generated_media: list[str] = field(default_factory=list)
 
     on_progress: Callable[..., Awaitable[None]] | None = None
     on_stream: Callable[[str], Awaitable[None]] | None = None
@@ -135,6 +155,11 @@ class AgentLoop:
     @property
     def tool_names(self) -> list[str]:
         return self.tools.tool_names
+
+    def llm_runtime(self) -> LLMRuntime:
+        """Return the current provider/model pair owned by this loop."""
+        self._refresh_provider_snapshot()
+        return LLMRuntime(self.provider, self.model)
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
@@ -245,6 +270,11 @@ class AgentLoop:
             multi_user=multi_user,
         )
         self.sessions = session_manager or SessionManager(workspace)
+        self._webui_turns = WebuiTurnCoordinator(
+            bus=self.bus,
+            sessions=self.sessions,
+            schedule_background=lambda coro: self._schedule_background(coro),
+        )
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
@@ -535,34 +565,7 @@ class AgentLoop:
         self, msg: InboundMessage
     ) -> Callable[..., Awaitable[None]]:
         """Build a progress callback that publishes to the message bus."""
-
-        async def _bus_progress(
-            content: str,
-            *,
-            tool_hint: bool = False,
-            tool_events: list[dict[str, Any]] | None = None,
-            reasoning: bool = False,
-            reasoning_end: bool = False,
-        ) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            if reasoning:
-                meta["_reasoning_delta"] = True
-            if reasoning_end:
-                meta["_reasoning_end"] = True
-            if tool_events:
-                meta["_tool_events"] = tool_events
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
-
-        return _bus_progress
+        return build_bus_progress_callback(self.bus, msg)
 
     async def _build_retry_wait_callback(
         self, msg: InboundMessage
@@ -957,38 +960,12 @@ class AgentLoop:
                             content="", metadata=msg.metadata or {},
                         ))
                     if msg.channel == "websocket":
-                        # Signal that the turn is fully complete (all tools executed,
-                        # final text streamed).  This lets WS clients know when to
-                        # definitively stop the loading indicator.
                         turn_lat = self._pending_turn_latency_ms.pop(session_key, None)
-                        turn_metadata: dict[str, Any] = {**msg.metadata, "_turn_end": True}
-                        if turn_lat is not None:
-                            turn_metadata["latency_ms"] = int(turn_lat)
-                        sess_turn = self.sessions.get_or_create(session_key)
-                        turn_metadata["goal_state"] = goal_state_ws_blob(sess_turn.metadata)
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=turn_metadata,
-                        ))
-                        if msg.metadata.get("webui") is True:
-                            async def _generate_title_and_notify() -> None:
-                                generated = await maybe_generate_webui_title_after_turn(
-                                    channel=msg.channel,
-                                    metadata=msg.metadata,
-                                    sessions=self.sessions,
-                                    session_key=session_key,
-                                    provider=self.provider,
-                                    model=self.model,
-                                )
-                                if generated:
-                                    await self.bus.publish_outbound(OutboundMessage(
-                                        channel=msg.channel,
-                                        chat_id=msg.chat_id,
-                                        content="",
-                                        metadata={**msg.metadata, "_session_updated": True},
-                                    ))
-
-                            self._schedule_background(_generate_title_and_notify())
+                        await self._webui_turns.handle_turn_end(
+                            msg,
+                            session_key=session_key,
+                            latency_ms=turn_lat,
+                        )
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     # Preserve partial context from the interrupted turn so
@@ -1040,8 +1017,9 @@ class AgentLoop:
                         "Re-published {} leftover message(s) to bus for session {}",
                         leftover, session_key,
                     )
-            await publish_turn_run_status(self.bus, msg, "idle")
+            await self._webui_turns.publish_run_status(msg, "idle")
             self._pending_turn_latency_ms.pop(session_key, None)
+            self._webui_turns.discard(session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1091,8 +1069,7 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        if msg.metadata and "user_id" in msg.metadata:
-            session.metadata["user_id"] = msg.metadata["user_id"]
+        _sync_privacy_metadata(session.metadata, msg.metadata)
 
         memory_store = self.context.memory_store_for_session_metadata(
             session.metadata if session else None,
@@ -1261,7 +1238,6 @@ class AgentLoop:
         all_msgs: list[dict[str, Any]],
         stop_reason: str,
         had_injections: bool,
-        generated_media: list[str],
         on_stream: Callable[[str], Awaitable[None]] | None,
         *,
         turn_latency_ms: int | None = None,
@@ -1285,7 +1261,6 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            media=generated_media,
             metadata=meta,
         )
 
@@ -1307,11 +1282,7 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         mark_webui_session(ctx.session, msg.metadata)
 
-        # Persist chat-scoped metadata to session metadata for Dream processing
-        if msg.metadata and "member_count" in msg.metadata:
-            ctx.session.metadata["member_count"] = msg.metadata["member_count"]
-        if msg.metadata and "user_id" in msg.metadata:
-            ctx.session.metadata["user_id"] = msg.metadata["user_id"]
+        _sync_privacy_metadata(ctx.session.metadata, msg.metadata)
 
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
@@ -1351,11 +1322,7 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        # Persist chat-scoped metadata to session.metadata for Dream processing
-        if ctx.msg.metadata and "member_count" in ctx.msg.metadata:
-            ctx.session.metadata["member_count"] = ctx.msg.metadata["member_count"]
-        if ctx.msg.metadata and "user_id" in ctx.msg.metadata:
-            ctx.session.metadata["user_id"] = ctx.msg.metadata["user_id"]
+        _sync_privacy_metadata(ctx.session.metadata, ctx.msg.metadata)
 
         memory_store = self.context.memory_store_for_session_metadata(
             ctx.session.metadata if ctx.session else None,
@@ -1383,6 +1350,11 @@ class AgentLoop:
             "include_timestamps": True,
         }
         ctx.history = ctx.session.get_history(**_hist_kwargs)
+        self._webui_turns.capture_title_context(
+            ctx.session_key,
+            ctx.msg,
+            self.llm_runtime(),
+        )
 
         ctx.initial_messages = self._build_initial_messages(
             ctx.msg, ctx.session, ctx.history, ctx.pending_summary
@@ -1399,7 +1371,7 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
-        await publish_turn_run_status(self.bus, ctx.msg, "running")
+        await self._webui_turns.publish_run_status(ctx.msg, "running")
         result = await self._run_agent_loop(
             ctx.initial_messages,
             on_progress=ctx.on_progress,
@@ -1427,11 +1399,6 @@ class AgentLoop:
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
-        skip_msgs = ctx.all_messages[ctx.save_skip:]
-        ctx.generated_media = generated_image_paths_from_messages(skip_msgs)
-        mt = self.tools.get("message")
-        extra = getattr(mt, "turn_delivered_media_paths", lambda: [])() if mt else []
-        merge_turn_media_into_last_assistant(ctx.all_messages, ctx.generated_media, extra)
 
         ctx.turn_latency_ms = max(0, int((time.time() - ctx.turn_wall_started_at) * 1000))
         self._save_turn(
@@ -1463,7 +1430,6 @@ class AgentLoop:
             ctx.all_messages,
             ctx.stop_reason,
             ctx.had_injections,
-            ctx.generated_media,
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
         )
