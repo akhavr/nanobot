@@ -926,3 +926,219 @@ class TestIsUserInAuthorizedGroup:
     ) -> None:
         """Should return False when members file is empty."""
         assert channel._is_user_in_authorized_group(456) is False
+
+
+class TestRemoveGroupMember:
+    """Tests for _remove_group_member functionality."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            group_allow_all=True,
+        )
+        bus = MagicMock()
+        return TelegramChannel(config, bus)
+
+    def test_remove_user_from_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should remove user from group's member list."""
+        save_group_members({"-100111": [456, 789, 123]})
+
+        channel._remove_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert 456 not in members["-100111"]
+        assert 789 in members["-100111"]
+        assert 123 in members["-100111"]
+
+    def test_remove_user_not_in_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should be no-op when user is not in group."""
+        save_group_members({"-100111": [789, 123]})
+
+        channel._remove_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert members["-100111"] == [789, 123]
+
+    def test_remove_from_nonexistent_group(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Should be no-op when group doesn't exist."""
+        save_group_members({"-100222": [456]})
+
+        channel._remove_group_member("-100111", 456)
+
+        members = load_group_members()
+        assert "-100111" not in members
+        assert members["-100222"] == [456]
+
+
+class TestChatMemberLeaveKick:
+    """Tests for _on_chat_member handling user leave/kick events."""
+
+    @pytest.fixture
+    def channel(self, state_dir: Path) -> TelegramChannel:
+        """Create a TelegramChannel for testing."""
+        config = TelegramConfig(
+            enabled=True,
+            token="test:token",
+            group_allow_all=True,
+        )
+        bus = MagicMock()
+        channel = TelegramChannel(config, bus)
+        channel._runtime_groups = {"-100111", "-100222"}
+        channel._app = MagicMock()
+        return channel
+
+    def _make_chat_member_update(
+        self,
+        chat_id: int,
+        user_id: int,
+        old_status: str,
+        new_status: str,
+    ) -> MagicMock:
+        """Build a mock chat_member update for user leave/kick."""
+        update = MagicMock()
+        update.chat_member = MagicMock()
+        update.chat_member.chat = MagicMock()
+        update.chat_member.chat.id = chat_id
+        update.chat_member.chat.type = "supergroup"
+        update.chat_member.old_chat_member = MagicMock()
+        update.chat_member.old_chat_member.status = old_status
+        update.chat_member.new_chat_member = MagicMock()
+        update.chat_member.new_chat_member.status = new_status
+        update.chat_member.new_chat_member.user = MagicMock()
+        update.chat_member.new_chat_member.user.id = user_id
+        return update
+
+    @pytest.mark.asyncio
+    async def test_user_left_removes_from_member_list(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User leaving should remove them from group's member list."""
+        save_group_members({
+            "-100111": [456, 789],
+            "-100222": [123],
+        })
+
+        update = self._make_chat_member_update(
+            chat_id=-100111,
+            user_id=456,
+            old_status="member",
+            new_status="left",
+        )
+
+        await channel._on_chat_member(update, MagicMock())
+
+        members = load_group_members()
+        assert 456 not in members["-100111"]
+        assert 789 in members["-100111"]
+
+    @pytest.mark.asyncio
+    async def test_user_kicked_removes_from_member_list(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User being kicked should remove them from group's member list."""
+        save_group_members({"-100111": [456, 789]})
+
+        update = self._make_chat_member_update(
+            chat_id=-100111,
+            user_id=456,
+            old_status="member",
+            new_status="kicked",
+        )
+
+        await channel._on_chat_member(update, MagicMock())
+
+        members = load_group_members()
+        assert 456 not in members["-100111"]
+
+    @pytest.mark.asyncio
+    async def test_user_removed_from_only_group_loses_dm_access(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User removed from their only authorized group should lose DM access."""
+        save_group_members({"-100111": [456]})
+
+        update = self._make_chat_member_update(
+            chat_id=-100111,
+            user_id=456,
+            old_status="member",
+            new_status="left",
+        )
+
+        # User should have DM access before
+        assert channel._is_user_in_authorized_group(456) is True
+
+        await channel._on_chat_member(update, MagicMock())
+
+        # User should lose DM access after
+        assert channel._is_user_in_authorized_group(456) is False
+
+    @pytest.mark.asyncio
+    async def test_user_in_multiple_groups_retains_dm_access(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """User removed from one group but in another should retain DM access."""
+        save_group_members({
+            "-100111": [456],
+            "-100222": [456, 789],  # User 456 is in both groups
+        })
+
+        update = self._make_chat_member_update(
+            chat_id=-100111,
+            user_id=456,
+            old_status="member",
+            new_status="left",
+        )
+
+        await channel._on_chat_member(update, MagicMock())
+
+        # User should still have DM access via group -100222
+        assert channel._is_user_in_authorized_group(456) is True
+
+        members = load_group_members()
+        assert 456 not in members["-100111"]
+        assert 456 in members["-100222"]
+
+    @pytest.mark.asyncio
+    async def test_leave_from_non_authorized_group_ignored(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Leave from non-authorized group should not affect member list."""
+        save_group_members({"-100333": [456]})
+
+        update = self._make_chat_member_update(
+            chat_id=-100333,  # Not in _runtime_groups
+            user_id=456,
+            old_status="member",
+            new_status="left",
+        )
+
+        await channel._on_chat_member(update, MagicMock())
+
+        # Member list should be unchanged
+        members = load_group_members()
+        assert members["-100333"] == [456]
+
+    @pytest.mark.asyncio
+    async def test_private_chat_ignored(
+        self, channel: TelegramChannel, state_dir: Path
+    ) -> None:
+        """Private chat updates should be ignored."""
+        update = MagicMock()
+        update.chat_member = MagicMock()
+        update.chat_member.chat = MagicMock()
+        update.chat_member.chat.type = "private"
+
+        await channel._on_chat_member(update, MagicMock())
+
+        # No crash, no changes
+        members = load_group_members()
+        assert members == {}

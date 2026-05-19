@@ -473,6 +473,14 @@ class TelegramChannel(BaseChannel):
             members[group_id].append(user_id)
             save_group_members(members)
 
+    def _remove_group_member(self, group_id: str, user_id: int) -> None:
+        """Remove user_id from the group's member list."""
+        members = load_group_members()
+        if group_id in members and user_id in members[group_id]:
+            members[group_id].remove(user_id)
+            save_group_members(members)
+            self.logger.debug("Removed user {} from group {} member list", user_id, group_id)
+
     def is_admin(self, sender_id: str) -> bool:
         """Check if sender is in the admin_users list."""
         admin_list = self.config.admin_users
@@ -2009,10 +2017,11 @@ class TelegramChannel(BaseChannel):
                 self.logger.warning("Failed to notify allowFrom user {}: {}", user_id, e)
 
     async def _on_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle other users joining/leaving a group (privacy boundary detection).
+        """Handle other users joining/leaving a group.
 
-        When a new member joins a group that was previously 1:1 (user + bot),
-        notify the admin that private context will no longer be loaded for that chat.
+        - When a new member joins a 1:1 group, notify admin about privacy boundary change.
+        - When a member leaves/is kicked from an authorized group, remove them from
+          group_members.json to potentially revoke their DM access.
         """
         if not update.chat_member:
             return
@@ -2029,9 +2038,18 @@ class TelegramChannel(BaseChannel):
         was_member = old_status in ("member", "administrator", "creator")
         is_member = new_status in ("member", "administrator", "creator")
 
-        # Detect new member joining (not leaving)
+        chat_id_str = str(chat.id)
+
         if not was_member and is_member:
             await self._check_privacy_boundary_change(chat)
+        elif was_member and not is_member:
+            user = chat_member.new_chat_member.user if chat_member.new_chat_member else None
+            if user and chat_id_str in self._runtime_groups:
+                self._remove_group_member(chat_id_str, user.id)
+                self.logger.info(
+                    "User {} left/kicked from authorized group {}, removed from member list",
+                    user.id, chat_id_str
+                )
 
     async def _check_privacy_boundary_change(self, chat) -> None:
         """Check if a group just crossed the privacy boundary (1:1 -> multi-user).
