@@ -36,6 +36,12 @@ from telegram.request import HTTPXRequest
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.telegram_state import (
+    load_group_members,
+    load_group_origins,
+    save_group_members,
+    save_group_origins,
+)
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
@@ -1694,6 +1700,20 @@ class TelegramChannel(BaseChannel):
             },
         )
 
+    def _is_user_in_allow_from(self, user_id: int, username: str | None) -> bool:
+        """Check if a user_id or username is in the allow_from list."""
+        allow_list = self.config.allow_from
+        if not allow_list:
+            return False
+        if "*" in allow_list:
+            return True
+        user_id_str = str(user_id)
+        if user_id_str in allow_list:
+            return True
+        if username and username in allow_list:
+            return True
+        return False
+
     async def _on_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle bot being added to or removed from a group."""
         if not update.my_chat_member:
@@ -1711,14 +1731,54 @@ class TelegramChannel(BaseChannel):
         was_member = old_status in ("member", "administrator", "creator")
         is_member = new_status in ("member", "administrator", "creator")
 
-        if not was_member and is_member:
-            chat_id = chat.id
-            chat_title = chat.title or "Unknown"
+        chat_id = chat.id
+        chat_id_str = str(chat_id)
+        chat_title = chat.title or "Unknown"
 
+        if not was_member and is_member:
+            # Bot was added to a group
             self._track_seen_group(chat_id, chat_title)
             self.logger.info("Bot added to group '{}' (ID: {})", chat_title, chat_id)
 
+            # Determine if adder is in allow_from
+            adder = chat_member.from_user
+            adder_id = adder.id if adder else 0
+            adder_username = adder.username if adder else None
+            is_approved = self._is_user_in_allow_from(adder_id, adder_username)
+
+            # Save to group_origins.json
+            origins = load_group_origins()
+            origins[chat_id_str] = {
+                "added_by": adder_id,
+                "added_at": time.time(),
+                "approved": is_approved,
+            }
+            save_group_origins(origins)
+
+            if is_approved:
+                self.logger.info("Group {} auto-approved (adder {} in allowFrom)", chat_id, adder_id)
+            else:
+                self.logger.info("Group {} pending approval (adder {} not in allowFrom)", chat_id, adder_id)
+
             await self._notify_admins_group_join(chat_id, chat_title)
+
+        elif was_member and not is_member:
+            # Bot was removed from a group
+            self.logger.info("Bot removed from group '{}' (ID: {})", chat_title, chat_id)
+
+            # Remove from group_origins.json
+            origins = load_group_origins()
+            if chat_id_str in origins:
+                del origins[chat_id_str]
+                save_group_origins(origins)
+                self.logger.debug("Removed group {} from origins", chat_id)
+
+            # Remove all members from this group in group_members.json
+            members = load_group_members()
+            if chat_id_str in members:
+                del members[chat_id_str]
+                save_group_members(members)
+                self.logger.debug("Removed members for group {}", chat_id)
 
     async def _notify_admins_group_join(self, chat_id: int, chat_title: str) -> None:
         """Send DM to all configured admins when bot joins a new group."""
