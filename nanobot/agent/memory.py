@@ -787,6 +787,8 @@ class Consolidator:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=self.max_completion_tokens,
+                temperature=0.3,
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
@@ -1233,6 +1235,8 @@ class Dream:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=self.max_completion_tokens,
+                temperature=0.3,
             )
             analysis = phase1_response.content or ""
             logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
@@ -1426,6 +1430,8 @@ class Dream:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=self.max_completion_tokens,
+                temperature=0.3,
             )
             analysis = phase1_response.content or ""
             logger.debug(
@@ -1584,6 +1590,8 @@ class Dream:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=self.max_completion_tokens,
+                temperature=0.3,
             )
             analysis = phase1_response.content or ""
             logger.debug(
