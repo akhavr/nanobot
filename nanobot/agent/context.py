@@ -74,6 +74,9 @@ class ContextBuilder:
         )
         if bootstrap:
             parts.append(bootstrap)
+
+        parts.append(render_template("agent/tool_contract.md"))
+
         memory = store.get_memory_context()
         if memory and not self._is_template_content(
             store.read_memory(),
@@ -258,9 +261,14 @@ class ContextBuilder:
         member_count: int | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         memory_store: MemoryStore | None = None,
+        current_runtime_lines: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        extra = goal_state_runtime_lines(session_metadata)
+        extra = [
+            *goal_state_runtime_lines(session_metadata),
+        ]
+        if current_runtime_lines:
+            extra.extend(line for line in current_runtime_lines if line)
         user_id = None
         if session_metadata and "user_id" in session_metadata:
             raw_user_id = session_metadata.get("user_id")
