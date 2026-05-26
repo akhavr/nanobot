@@ -1960,3 +1960,182 @@ async def test_callback_query_ignores_unauthorized_user_before_side_effects() ->
     query.answer.assert_not_awaited()
     query.message.edit_reply_markup.assert_not_awaited()
     channel._handle_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Bot-to-bot loop prevention tests (Telegram Bot-to-Bot Communication Mode)
+# ---------------------------------------------------------------------------
+
+
+def _make_bot_telegram_update(
+    *,
+    chat_type: str = "group",
+    text: str | None = None,
+    caption: str | None = None,
+    entities=None,
+    reply_to_message=None,
+    is_bot: bool = True,
+):
+    """Create a telegram update from a bot user."""
+    user = SimpleNamespace(id=99999, username="other_bot", first_name="OtherBot", is_bot=is_bot)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type=chat_type, is_forum=False),
+        chat_id=-100123,
+        text=text,
+        caption=caption,
+        entities=entities or [],
+        caption_entities=[],
+        reply_to_message=reply_to_message,
+        photo=None,
+        voice=None,
+        audio=None,
+        document=None,
+        location=None,
+        media_group_id=None,
+        message_thread_id=None,
+        message_id=1,
+    )
+    return SimpleNamespace(message=message, effective_user=user)
+
+
+@pytest.mark.asyncio
+async def test_bot_fresh_message_gets_response() -> None:
+    """Bot sends non-reply message -> respond."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    update = _make_bot_telegram_update(text="Hello from bot", is_bot=True)
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    assert "Hello from bot" in handled[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_bot_mention_gets_response() -> None:
+    """Bot @mentions us (no reply) -> respond."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    mention = SimpleNamespace(type="mention", offset=0, length=13)
+    update = _make_bot_telegram_update(
+        text="@nanobot_test hello", entities=[mention], is_bot=True
+    )
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_bot_reply_to_our_message_ignored() -> None:
+    """Bot replies to our message -> ignore, log."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),  # our bot ID from _FakeBot.get_me
+        text="original message",
+    )
+    update = _make_bot_telegram_update(
+        text="Reply from other bot", reply_to_message=our_message, is_bot=True
+    )
+    await channel._on_message(update, None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_bot2bot_prevention_disabled() -> None:
+    """Config bot2bot_loop_prevention=False -> respond to bot replies."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            bot2bot_loop_prevention=False,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        text="original message",
+    )
+    update = _make_bot_telegram_update(
+        text="Reply from other bot", reply_to_message=our_message, is_bot=True
+    )
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_is_from_bot_detection() -> None:
+    """Verify from_user.is_bot check works correctly."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        text="original message",
+    )
+    update = _make_bot_telegram_update(
+        text="Reply from human", reply_to_message=our_message, is_bot=False
+    )
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+
+
+def test_bot2bot_loop_prevention_defaults_to_true() -> None:
+    """bot2bot_loop_prevention should default to True for safety."""
+    assert TelegramConfig().bot2bot_loop_prevention is True
