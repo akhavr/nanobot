@@ -1038,7 +1038,14 @@ class AgentLoop:
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
-        task = asyncio.create_task(coro)
+
+        async def _wrapped():
+            try:
+                await coro
+            except Exception:
+                logger.exception("Background task failed")
+
+        task = asyncio.create_task(_wrapped())
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
