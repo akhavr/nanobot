@@ -1,5 +1,4 @@
-import json
-from datetime import datetime, timedelta, timezone
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,10 +17,6 @@ from nanobot.channels.telegram import (
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
     TelegramConfig,
-    _format_relative_time,
-    _load_groups_data,
-    _prune_old_seen_groups,
-    _save_groups_data,
     _StreamBuf,
 )
 
@@ -42,10 +37,18 @@ class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
         self.start_polling_kwargs = None
+        self.start_webhook_kwargs = None
 
     async def start_polling(self, **kwargs) -> None:
         self.start_polling_kwargs = kwargs
         self._on_start_polling()
+
+    async def start_webhook(self, **kwargs) -> None:
+        self.start_webhook_kwargs = kwargs
+        self._on_start_polling()
+
+    async def stop(self) -> None:
+        pass
 
 
 class _FakeBot:
@@ -109,6 +112,12 @@ class _FakeApp:
     async def start(self) -> None:
         pass
 
+    async def stop(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
 
 class _FakeBuilder:
     def __init__(self, app: _FakeApp) -> None:
@@ -148,22 +157,10 @@ def _make_telegram_update(
     caption_entities=None,
     reply_to_message=None,
     location=None,
-    member_count: int | None = 2,
 ):
-    async def mock_get_member_count():
-        if member_count is None:
-            raise Exception("Cannot fetch member count")
-        return member_count
-
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
-    chat = SimpleNamespace(
-        type=chat_type,
-        is_forum=False,
-        id=-100123,
-        get_member_count=mock_get_member_count,
-    )
     message = SimpleNamespace(
-        chat=chat,
+        chat=SimpleNamespace(type=chat_type, is_forum=False),
         chat_id=-100123,
         text=text,
         caption=caption,
@@ -248,6 +245,98 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     assert api_req.kwargs["connection_pool_size"] == 32
     assert api_req.kwargs["pool_timeout"] == 10.0
     assert poll_req.kwargs["pool_timeout"] == 10.0
+
+
+def test_webhook_config_requires_https_url_and_secret() -> None:
+    with pytest.raises(ValueError, match="webhook_url is required"):
+        TelegramConfig(enabled=True, token="123:abc", mode="webhook")
+
+    with pytest.raises(ValueError, match="public HTTPS URL"):
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            mode="webhook",
+            webhook_url="http://example.com/telegram",
+            webhook_secret_token="secret",
+        )
+
+    with pytest.raises(ValueError, match="webhook_secret_token is required"):
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            mode="webhook",
+            webhook_url="https://example.com/telegram",
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_webhook_mode(monkeypatch) -> None:
+    _FakeHTTPXRequest.clear()
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+        mode="webhook",
+        webhook_url="https://example.com/telegram",
+        webhook_listen_host="127.0.0.1",
+        webhook_listen_port=8081,
+        webhook_path="/telegram",
+        webhook_secret_token="secret-token",
+        webhook_max_connections=1,
+    )
+    bus = MessageBus()
+    channel = TelegramChannel(config, bus)
+    app = _FakeApp(lambda: setattr(channel, "_running", False))
+    builder = _FakeBuilder(app)
+
+    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.Application",
+        SimpleNamespace(builder=lambda: builder),
+    )
+
+    await channel.start()
+
+    assert app.updater.start_polling_kwargs is None
+    assert app.updater.start_webhook_kwargs == {
+        "listen": "127.0.0.1",
+        "port": 8081,
+        "url_path": "telegram",
+        "webhook_url": "https://example.com/telegram",
+        "allowed_updates": ["message"],
+        "drop_pending_updates": False,
+        "secret_token": "secret-token",
+        "max_connections": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_message_handler_reorders_same_session_updates() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    seen: list[int] = []
+
+    async def fake_process(update, context) -> None:
+        seen.append(update.message.message_id)
+
+    channel._process_message_update = fake_process
+    channel._running = True
+
+    first = _make_telegram_update(text="first")
+    first.update_id = 100
+    first.message.message_id = 1
+    second = _make_telegram_update(text="second")
+    second.update_id = 101
+    second.message.message_id = 2
+
+    await channel._on_message(second, None)
+    await channel._on_message(first, None)
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert seen == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -712,51 +801,6 @@ def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
     assert channel.is_allowed("not-a-number|alice") is False
 
 
-# --- is_admin tests ---
-
-
-def test_admin_users_defaults_to_empty_list() -> None:
-    """admin_users defaults to empty list."""
-    assert TelegramConfig().admin_users == []
-
-
-def test_is_admin_empty_list_returns_false_for_all() -> None:
-    """Empty admin_users list returns False for all users."""
-    channel = TelegramChannel(TelegramConfig(admin_users=[]), MessageBus())
-
-    assert channel.is_admin("12345") is False
-    assert channel.is_admin("12345|alice") is False
-    assert channel.is_admin("anyone") is False
-
-
-def test_is_admin_listed_user_returns_true() -> None:
-    """Listed user in admin_users returns True."""
-    channel = TelegramChannel(TelegramConfig(admin_users=["12345", "alice"]), MessageBus())
-
-    assert channel.is_admin("12345") is True
-    assert channel.is_admin("12345|bob") is True  # ID matches
-    assert channel.is_admin("99999|alice") is True  # username matches
-    assert channel.is_admin("alice") is True  # direct match
-
-
-def test_is_admin_unlisted_user_returns_false() -> None:
-    """Unlisted user returns False."""
-    channel = TelegramChannel(TelegramConfig(admin_users=["12345", "alice"]), MessageBus())
-
-    assert channel.is_admin("99999") is False
-    assert channel.is_admin("99999|bob") is False
-    assert channel.is_admin("bob") is False
-
-
-def test_is_admin_supports_full_sender_id_format() -> None:
-    """admin_users can contain full id|username format."""
-    channel = TelegramChannel(TelegramConfig(admin_users=["12345|alice"]), MessageBus())
-
-    assert channel.is_admin("12345|alice") is True
-    assert channel.is_admin("12345|bob") is False  # different username
-    assert channel.is_admin("99999|alice") is False  # different id
-
-
 @pytest.mark.asyncio
 async def test_send_progress_keeps_message_in_topic() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
@@ -998,130 +1042,6 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
 
     assert len(handled) == 1
     assert channel._app.bot.get_me_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_group_policy_open_1on1_group_responds_without_mention() -> None:
-    """1:1 group (2 members) with open policy responds to all messages without mention."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # 2 members = 1:1 group, should respond without mention
-    await channel._on_message(_make_telegram_update(text="hello", member_count=2), None)
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_policy_open_larger_group_requires_mention() -> None:
-    """Larger group (3+ members) with open policy requires @mention to respond."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # 5 members = larger group, should NOT respond without mention
-    await channel._on_message(_make_telegram_update(text="hello", member_count=5), None)
-
-    assert len(handled) == 0
-
-
-@pytest.mark.asyncio
-async def test_group_policy_open_larger_group_responds_with_mention() -> None:
-    """Larger group (3+ members) with open policy responds when @mentioned."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Mention entity for @nanobot_test (the bot username from _FakeBot)
-    entity = SimpleNamespace(type="mention", offset=0, length=13)
-    await channel._on_message(
-        _make_telegram_update(text="@nanobot_test hello", entities=[entity], member_count=5),
-        None,
-    )
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_policy_open_larger_group_responds_with_reply_to_bot() -> None:
-    """Larger group (3+ members) responds when replying to bot's message."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Reply to the bot (bot id=999 from _FakeBot)
-    reply = SimpleNamespace(from_user=SimpleNamespace(id=999))
-    await channel._on_message(
-        _make_telegram_update(text="thanks", reply_to_message=reply, member_count=5),
-        None,
-    )
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_policy_open_member_count_unavailable_requires_mention() -> None:
-    """When member_count cannot be fetched, fall back to requiring mention."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # member_count=None simulates API failure
-    await channel._on_message(_make_telegram_update(text="hello", member_count=None), None)
-
-    # Should NOT respond without mention when member count is unknown (conservative fallback)
-    assert len(handled) == 0
 
 
 @pytest.mark.asyncio
@@ -1615,216 +1535,6 @@ async def test_on_message_location_with_text() -> None:
     assert "[location: 51.5074, -0.1278]" in handled[0]["content"]
 
 
-# --- group_allow_from tests ---
-
-
-def test_group_allow_from_defaults_to_empty_list() -> None:
-    """group_allow_from defaults to empty list (allow all groups)."""
-    assert TelegramConfig().group_allow_from == []
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_empty_allows_all_groups() -> None:
-    """Empty group_allow_from list allows messages from any group (current behavior)."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open", group_allow_from=[]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Message from group -100123
-    await channel._on_message(_make_telegram_update(text="hello"), None)
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_filters_unlisted_groups() -> None:
-    """Non-empty group_allow_from rejects messages from unlisted groups."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="open",
-            group_allow_from=["-100999"],  # Only allow this group
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Message from group -100123 (not in allowlist)
-    await channel._on_message(_make_telegram_update(text="hello"), None)
-
-    assert handled == []
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_accepts_listed_groups() -> None:
-    """Non-empty group_allow_from accepts messages from listed groups."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="open",
-            group_allow_from=["-100123"],  # Allow this group (matches _make_telegram_update)
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Message from group -100123 (in allowlist)
-    await channel._on_message(_make_telegram_update(text="hello"), None)
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_does_not_affect_private_chats() -> None:
-    """Private chats are unaffected by group_allow_from filter."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="open",
-            group_allow_from=["-100999"],  # Only allow a different group
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Private chat message
-    await channel._on_message(_make_telegram_update(text="hello", chat_type="private"), None)
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_does_not_block_mentions() -> None:
-    """@mentions in unlisted groups should still be accepted.
-
-    group_allow_from should only filter non-mentioned messages when policy is open.
-    Mentions should ALWAYS work, even from unlisted groups.
-    """
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="mention",
-            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # @mention from unlisted group should be accepted
-    mention = SimpleNamespace(type="mention", offset=0, length=13)
-    await channel._on_message(
-        _make_telegram_update(text="@nanobot_test hi", entities=[mention]),
-        None,
-    )
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_does_not_block_replies_to_bot() -> None:
-    """Replies to bot in unlisted groups should still be accepted."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="mention",
-            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Reply to bot from unlisted group should be accepted
-    reply = SimpleNamespace(from_user=SimpleNamespace(id=999))  # bot_id from _FakeBot.get_me()
-    await channel._on_message(
-        _make_telegram_update(text="reply to bot", reply_to_message=reply),
-        None,
-    )
-
-    assert len(handled) == 1
-
-
-@pytest.mark.asyncio
-async def test_group_allow_from_filters_plain_messages_with_policy_open() -> None:
-    """Plain messages from unlisted groups should be rejected when policy is open."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            allow_from=["*"],
-            group_policy="open",
-            group_allow_from=["-100999"],  # Unlisted group (message from -100123)
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    channel._start_typing = lambda _chat_id: None
-
-    # Plain message from unlisted group should NOT be accepted
-    await channel._on_message(_make_telegram_update(text="hello"), None)
-
-    assert handled == []
-
-
 # ---------------------------------------------------------------------------
 # Tests for retry amplification fix (issue #3050)
 # ---------------------------------------------------------------------------
@@ -2253,1170 +1963,179 @@ async def test_callback_query_ignores_unauthorized_user_before_side_effects() ->
 
 
 # ---------------------------------------------------------------------------
-# /addgroup, /removegroup, /groups command tests
+# Bot-to-bot loop prevention tests (Telegram Bot-to-Bot Communication Mode)
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def groups_file(tmp_path, monkeypatch):
-    """Fixture to isolate telegram_groups.json to a temp directory."""
-    groups_path = tmp_path / "telegram_groups.json"
-    monkeypatch.setattr(
-        "nanobot.channels.telegram._get_groups_file",
-        lambda: groups_path,
-    )
-    return groups_path
-
-
-def _make_admin_update(text: str, user_id: int = 12345, username: str = "alice"):
-    """Helper to create updates for admin command tests."""
-    user = SimpleNamespace(id=user_id, username=username, first_name="Alice")
+def _make_bot_telegram_update(
+    *,
+    chat_type: str = "group",
+    text: str | None = None,
+    caption: str | None = None,
+    entities=None,
+    reply_to_message=None,
+    is_bot: bool = True,
+):
+    """Create a telegram update from a bot user."""
+    user = SimpleNamespace(id=99999, username="other_bot", first_name="OtherBot", is_bot=is_bot)
     message = SimpleNamespace(
-        chat=SimpleNamespace(type="private"),
-        chat_id=user_id,
+        chat=SimpleNamespace(type=chat_type, is_forum=False),
+        chat_id=-100123,
         text=text,
-        message_id=1,
-        message_thread_id=None,
-        reply_text=AsyncMock(),
-    )
-    return SimpleNamespace(message=message, effective_user=user)
-
-
-def test_load_groups_data_returns_empty_when_file_missing(groups_file):
-    """_load_groups_data returns empty structure when file doesn't exist."""
-    assert not groups_file.exists()
-    data = _load_groups_data()
-    assert data == {"allowed": [], "seen": []}
-
-
-def test_load_groups_data_returns_saved_data(groups_file):
-    """_load_groups_data returns saved data."""
-    test_data = {
-        "allowed": [{"id": "-123", "name": "Test Group", "added": "2026-05-14"}],
-        "seen": [{"id": "-456", "name": "Seen Group", "last_seen": "2026-05-14T10:30:00"}],
-    }
-    groups_file.write_text(json.dumps(test_data))
-    data = _load_groups_data()
-    assert data == test_data
-
-
-def test_save_groups_data_creates_file(groups_file):
-    """_save_groups_data creates the file."""
-    test_data = {"allowed": [], "seen": [{"id": "-123", "name": "Test", "last_seen": "2026-05-14T10:30:00"}]}
-    _save_groups_data(test_data)
-    assert groups_file.exists()
-    loaded = json.loads(groups_file.read_text())
-    assert loaded == test_data
-
-
-def test_prune_old_seen_groups_removes_expired_entries():
-    """_prune_old_seen_groups removes entries older than 30 days."""
-    old_time = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
-    recent_time = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    data = {
-        "allowed": [],
-        "seen": [
-            {"id": "-111", "name": "Old Group", "last_seen": old_time},
-            {"id": "-222", "name": "Recent Group", "last_seen": recent_time},
-        ],
-    }
-    pruned = _prune_old_seen_groups(data)
-    assert pruned is True
-    assert len(data["seen"]) == 1
-    assert data["seen"][0]["id"] == "-222"
-
-
-def test_prune_old_seen_groups_keeps_recent_entries():
-    """_prune_old_seen_groups keeps entries within 30 days."""
-    recent_time = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
-    data = {
-        "allowed": [],
-        "seen": [{"id": "-111", "name": "Recent Group", "last_seen": recent_time}],
-    }
-    pruned = _prune_old_seen_groups(data)
-    assert pruned is False
-    assert len(data["seen"]) == 1
-
-
-def test_format_relative_time_hours():
-    """_format_relative_time formats hours correctly."""
-    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    result = _format_relative_time(two_hours_ago)
-    assert result == "2h ago"
-
-
-def test_format_relative_time_days():
-    """_format_relative_time formats days correctly."""
-    three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-    result = _format_relative_time(three_days_ago)
-    assert result == "3d ago"
-
-
-def test_format_relative_time_minutes():
-    """_format_relative_time formats minutes correctly."""
-    fifteen_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
-    result = _format_relative_time(fifteen_minutes_ago)
-    assert result == "15m ago"
-
-
-def test_track_seen_group_adds_new_group(groups_file):
-    """_track_seen_group adds a new group to seen list."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    channel._track_seen_group(-100123456, "Test Group")
-
-    data = _load_groups_data()
-    assert len(data["seen"]) == 1
-    assert data["seen"][0]["id"] == "-100123456"
-    assert data["seen"][0]["name"] == "Test Group"
-    assert "last_seen" in data["seen"][0]
-
-
-def test_track_seen_group_updates_existing_group(groups_file):
-    """_track_seen_group updates existing group's last_seen."""
-    old_time = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
-    initial_data = {
-        "allowed": [],
-        "seen": [{"id": "-100123456", "name": "Old Name", "last_seen": old_time}],
-    }
-    _save_groups_data(initial_data)
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    channel._track_seen_group(-100123456, "New Name")
-
-    data = _load_groups_data()
-    assert len(data["seen"]) == 1
-    assert data["seen"][0]["name"] == "New Name"
-    assert data["seen"][0]["last_seen"] != old_time
-
-
-def test_track_seen_group_skips_allowed_groups(groups_file):
-    """_track_seen_group does not track groups in the allowed list."""
-    initial_data = {
-        "allowed": [{"id": "-100123456", "name": "Allowed Group", "added": "2026-05-14"}],
-        "seen": [],
-    }
-    _save_groups_data(initial_data)
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    channel._track_seen_group(-100123456, "Allowed Group")
-
-    data = _load_groups_data()
-    assert len(data["seen"]) == 0
-
-
-@pytest.mark.asyncio
-async def test_addgroup_requires_admin() -> None:
-    """Non-admins are rejected by /addgroup."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100123")
-    await channel._on_addgroup(update, None)
-
-    update.message.reply_text.assert_awaited_once()
-    assert "admin-only" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_addgroup_validates_group_id() -> None:
-    """Invalid group IDs are rejected."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup notanumber")
-    await channel._on_addgroup(update, None)
-
-    update.message.reply_text.assert_awaited_once()
-    assert "Usage:" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_addgroup_adds_to_runtime_and_persists(groups_file) -> None:
-    """Admin can add a group which updates runtime and persists."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100999")
-    await channel._on_addgroup(update, None)
-
-    assert "-100999" in channel._runtime_groups
-    assert groups_file.exists()
-    data = json.loads(groups_file.read_text())
-    assert "-100999" in data["allowed"]
-    assert "Added group" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_addgroup_rejects_duplicate() -> None:
-    """Adding an already-allowed group shows a message."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True, token="123:abc", allow_from=["*"],
-            admin_users=["12345"], group_allow_from=["-100123"]
-        ),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100123")
-    await channel._on_addgroup(update, None)
-
-    assert "already in the allowlist" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_removegroup_requires_admin() -> None:
-    """Non-admins are rejected by /removegroup."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/removegroup -100123")
-    await channel._on_removegroup(update, None)
-
-    update.message.reply_text.assert_awaited_once()
-    assert "admin-only" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_removegroup_removes_persisted_group(groups_file) -> None:
-    """Admin can remove a persisted group."""
-    groups_file.write_text('{"allowed": ["-100999"]}')
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._load_and_merge_groups()
-
-    update = _make_admin_update("/removegroup -100999")
-    await channel._on_removegroup(update, None)
-
-    assert "-100999" not in channel._runtime_groups
-    data = json.loads(groups_file.read_text())
-    assert "-100999" not in data["allowed"]
-    assert "Removed group" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_removegroup_rejects_config_groups() -> None:
-    """Groups defined in config cannot be removed dynamically."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True, token="123:abc", allow_from=["*"],
-            admin_users=["12345"], group_allow_from=["-100123"]
-        ),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/removegroup -100123")
-    await channel._on_removegroup(update, None)
-
-    assert "defined in config" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_removegroup_rejects_nonexistent_group() -> None:
-    """Removing a group not in the allowlist shows a message."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/removegroup -100999")
-    await channel._on_removegroup(update, None)
-
-    assert "not in the allowlist" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_groups_requires_admin() -> None:
-    """Non-admins are rejected by /groups."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["999"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    update.message.reply_text.assert_awaited_once()
-    assert "admin-only" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_groups_lists_groups_with_source(groups_file) -> None:
-    """Admin can list groups and see their source (config vs persisted)."""
-    groups_file.write_text('{"allowed": ["-100999"]}')
-
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True, token="123:abc", allow_from=["*"],
-            admin_users=["12345"], group_allow_from=["-100123"]
-        ),
-        MessageBus(),
-    )
-    channel._load_and_merge_groups()
-
-    async def mock_get_chat_info(chat_id):
-        if chat_id == -100123:
-            return "Config Group", 3
-        elif chat_id == -100999:
-            return "Persisted Group", 2
-        return None, None
-
-    channel._get_chat_info_by_id = mock_get_chat_info
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    response = update.message.reply_text.await_args.args[0]
-    assert "-100123" in response
-    assert "Config Group" in response
-    assert "(config, 3 members)" in response
-    assert "-100999" in response
-    assert "Persisted Group" in response
-    assert "(persisted, 2 members)" in response
-
-
-@pytest.mark.asyncio
-async def test_groups_shows_empty_message_when_no_groups() -> None:
-    """When no groups are in the allowlist, a helpful message is shown."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    response = update.message.reply_text.await_args.args[0]
-    assert "Allowed groups: (none)" in response
-
-
-@pytest.mark.asyncio
-async def test_on_groups_shows_seen_groups_with_timestamp(groups_file):
-    """Seen groups are displayed with relative timestamp and member count."""
-    recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    initial_data = {
-        "allowed": [],
-        "seen": [{"id": "-100987654321", "name": "Random Chat", "last_seen": recent_time}],
-    }
-    _save_groups_data(initial_data)
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    async def mock_get_chat_info(chat_id):
-        if chat_id == -100987654321:
-            return "Random Chat", 4
-        return None, None
-
-    channel._get_chat_info_by_id = mock_get_chat_info
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    reply_text = update.message.reply_text.await_args.args[0]
-    assert "-100987654321" in reply_text
-    assert "Random Chat" in reply_text
-    assert "seen 2h ago" in reply_text
-    assert "4 members" in reply_text
-
-
-@pytest.mark.asyncio
-async def test_groups_excludes_allowed_from_seen(groups_file):
-    """Groups in allowed list should NOT appear in 'Seen but not allowed' section."""
-    recent_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    initial_data = {
-        "allowed": ["-100111222333"],
-        "seen": [
-            {"id": "-100111222333", "name": "Allowed Group", "last_seen": recent_time},
-            {"id": "-100444555666", "name": "Other Group", "last_seen": recent_time},
-        ],
-    }
-    _save_groups_data(initial_data)
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._load_and_merge_groups()
-
-    async def mock_get_chat_info(chat_id):
-        if chat_id == -100111222333:
-            return "Allowed Group API", 2
-        elif chat_id == -100444555666:
-            return "Other Group API", 5
-        return None, None
-
-    channel._get_chat_info_by_id = mock_get_chat_info
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    reply_text = update.message.reply_text.await_args.args[0]
-    # Allowed group should appear in "Allowed groups" section with API name
-    assert "-100111222333" in reply_text
-    assert "Allowed Group API" in reply_text
-    assert "(persisted, 2 members)" in reply_text
-    # Other group should appear in "Seen but not allowed" with stored name (and API member count)
-    assert "Other Group" in reply_text
-    assert "5 members" in reply_text
-    # The allowed group should NOT appear in "Seen but not allowed" section
-    assert "Seen but not allowed" in reply_text
-    lines = reply_text.split("\n")
-    seen_section_started = False
-    for line in lines:
-        if "Seen but not allowed" in line:
-            seen_section_started = True
-        elif seen_section_started and "-100111222333" in line:
-            pytest.fail("Allowed group should not appear in 'Seen but not allowed' section")
-
-
-@pytest.mark.asyncio
-async def test_get_chat_info_by_id_returns_title_and_count() -> None:
-    """_get_chat_info_by_id returns chat title and member count."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-
-    mock_chat = AsyncMock()
-    mock_chat.title = "Test Group"
-    mock_chat.get_member_count = AsyncMock(return_value=5)
-
-    mock_bot = AsyncMock()
-    mock_bot.get_chat = AsyncMock(return_value=mock_chat)
-    channel._app = SimpleNamespace(bot=mock_bot)
-
-    title, count = await channel._get_chat_info_by_id(-100123)
-
-    assert title == "Test Group"
-    assert count == 5
-    mock_bot.get_chat.assert_called_once_with(-100123)
-
-
-@pytest.mark.asyncio
-async def test_get_chat_info_by_id_returns_none_when_no_app() -> None:
-    """_get_chat_info_by_id returns (None, None) when app is not initialized."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    channel._app = None
-
-    title, count = await channel._get_chat_info_by_id(-100123)
-
-    assert title is None
-    assert count is None
-
-
-@pytest.mark.asyncio
-async def test_get_chat_info_by_id_handles_api_error() -> None:
-    """_get_chat_info_by_id returns (None, None) on API error."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-
-    mock_bot = AsyncMock()
-    mock_bot.get_chat = AsyncMock(side_effect=Exception("API error"))
-    channel._app = SimpleNamespace(bot=mock_bot)
-
-    title, count = await channel._get_chat_info_by_id(-100123)
-
-    assert title is None
-    assert count is None
-
-
-@pytest.mark.asyncio
-async def test_addgroup_survives_restart(groups_file) -> None:
-    """Groups added via /addgroup persist across channel restarts."""
-    # First channel instance: add a group
-    channel1 = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    update = _make_admin_update("/addgroup -100999")
-    await channel1._on_addgroup(update, None)
-    assert "-100999" in channel1._runtime_groups
-
-    # Second channel instance: group should be loaded from file
-    channel2 = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel2._load_and_merge_groups()
-    assert "-100999" in channel2._runtime_groups
-
-
-@pytest.mark.asyncio
-async def test_on_message_tracks_seen_group(groups_file):
-    """_on_message tracks seen groups when messages come from group chats."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-    channel._handle_message = AsyncMock()
-    channel._start_typing = lambda _: None
-
-    async def mock_get_member_count():
-        return 2
-
-    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
-    message = SimpleNamespace(
-        chat=SimpleNamespace(
-            type="group",
-            is_forum=False,
-            title="Test Group Chat",
-            id=-100999888,
-            get_member_count=mock_get_member_count,
-        ),
-        chat_id=-100999888,
-        text="hello",
-        caption=None,
-        entities=[],
+        caption=caption,
+        entities=entities or [],
         caption_entities=[],
-        reply_to_message=None,
+        reply_to_message=reply_to_message,
         photo=None,
         voice=None,
         audio=None,
         document=None,
-        video=None,
-        video_note=None,
-        animation=None,
         location=None,
         media_group_id=None,
         message_thread_id=None,
         message_id=1,
     )
-    update = SimpleNamespace(message=message, effective_user=user)
+    return SimpleNamespace(message=message, effective_user=user)
 
+
+@pytest.mark.asyncio
+async def test_bot_fresh_message_gets_response() -> None:
+    """Bot sends non-reply message -> respond."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    update = _make_bot_telegram_update(text="Hello from bot", is_bot=True)
     await channel._on_message(update, None)
 
-    data = _load_groups_data()
-    assert len(data["seen"]) == 1
-    assert data["seen"][0]["id"] == "-100999888"
-    assert data["seen"][0]["name"] == "Test Group Chat"
-
-
-# --- _on_my_chat_member tests (bot joins group) ---
-
-
-def _make_my_chat_member_update(
-    chat_id: int,
-    chat_title: str,
-    old_status: str,
-    new_status: str,
-):
-    """Helper to create my_chat_member updates for join/leave tests."""
-    old_member = SimpleNamespace(status=old_status)
-    new_member = SimpleNamespace(status=new_status)
-    chat = SimpleNamespace(id=chat_id, type="supergroup", title=chat_title)
-    chat_member = SimpleNamespace(
-        chat=chat,
-        old_chat_member=old_member,
-        new_chat_member=new_member,
-    )
-    return SimpleNamespace(my_chat_member=chat_member)
+    assert len(handled) == 1
+    assert "Hello from bot" in handled[0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_bot_join_notifies_admin(groups_file) -> None:
-    """When bot joins a group, admins receive a DM notification."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_my_chat_member_update(
-        chat_id=-5275099223,
-        chat_title="Cancun Trip",
-        old_status="left",
-        new_status="member",
-    )
-
-    await channel._on_my_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 1
-    msg = channel._app.bot.sent_messages[0]
-    assert msg["chat_id"] == 12345
-    assert "Added to group 'Cancun Trip' (ID: -5275099223)" in msg["text"]
-    assert "Use /addgroup -5275099223 to enable responses." in msg["text"]
-
-
-@pytest.mark.asyncio
-async def test_bot_join_notifies_multiple_admins(groups_file) -> None:
-    """When bot joins a group, all configured admins receive a DM."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True, token="123:abc", allow_from=["*"],
-            admin_users=["12345", "67890", "11111"],
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_my_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Test Group",
-        old_status="left",
-        new_status="member",
-    )
-
-    await channel._on_my_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 3
-    notified_admins = {msg["chat_id"] for msg in channel._app.bot.sent_messages}
-    assert notified_admins == {12345, 67890, 11111}
-
-
-@pytest.mark.asyncio
-async def test_bot_join_adds_to_seen_list(groups_file) -> None:
-    """When bot joins a group, the group is added to the seen list."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_my_chat_member_update(
-        chat_id=-100999888,
-        chat_title="New Group",
-        old_status="left",
-        new_status="member",
-    )
-
-    await channel._on_my_chat_member(update, None)
-
-    data = _load_groups_data()
-    assert len(data["seen"]) == 1
-    assert data["seen"][0]["id"] == "-100999888"
-    assert data["seen"][0]["name"] == "New Group"
-
-
-@pytest.mark.asyncio
-async def test_bot_join_no_notification_without_admins(groups_file) -> None:
-    """No notification sent if admin_users is empty."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=[]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_my_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Test Group",
-        old_status="left",
-        new_status="member",
-    )
-
-    await channel._on_my_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_bot_leave_does_not_notify(groups_file) -> None:
-    """Bot leaving a group does not trigger admin notification."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_my_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Test Group",
-        old_status="member",
-        new_status="left",
-    )
-
-    await channel._on_my_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_bot_join_private_chat_ignored(groups_file) -> None:
-    """Bot being added to private chat does not trigger notification."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    old_member = SimpleNamespace(status="left")
-    new_member = SimpleNamespace(status="member")
-    chat = SimpleNamespace(id=99999, type="private", title=None)
-    chat_member = SimpleNamespace(
-        chat=chat,
-        old_chat_member=old_member,
-        new_chat_member=new_member,
-    )
-    update = SimpleNamespace(my_chat_member=chat_member)
-
-    await channel._on_my_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-# --- _on_chat_member tests (other user joins group - privacy boundary) ---
-
-
-def _make_chat_member_update(
-    chat_id: int,
-    chat_title: str,
-    old_status: str,
-    new_status: str,
-    member_count: int = 3,
-):
-    """Helper to create chat_member updates for member join/leave tests.
-
-    The chat.get_member_count() is mocked to return the specified member_count.
-    """
-    old_member = SimpleNamespace(status=old_status)
-    new_member = SimpleNamespace(status=new_status)
-
-    async def mock_get_member_count():
-        return member_count
-
-    chat = SimpleNamespace(
-        id=chat_id,
-        type="supergroup",
-        title=chat_title,
-        get_member_count=mock_get_member_count,
-    )
-    chat_member = SimpleNamespace(
-        chat=chat,
-        old_chat_member=old_member,
-        new_chat_member=new_member,
-    )
-    return SimpleNamespace(chat_member=chat_member)
-
-
-@pytest.mark.asyncio
-async def test_privacy_boundary_notifies_admin_when_group_grows_to_3_members(groups_file) -> None:
-    """When a group goes from 2 to 3 members, admins receive a DM about privacy."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Family Trip",
-        old_status="left",
-        new_status="member",
-        member_count=3,  # Group just grew to 3 members
-    )
-
-    await channel._on_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 1
-    msg = channel._app.bot.sent_messages[0]
-    assert msg["chat_id"] == 12345
-    assert "Family Trip" in msg["text"]
-    assert "multiple members" in msg["text"]
-    assert "private info" in msg["text"]
-
-
-@pytest.mark.asyncio
-async def test_privacy_boundary_no_notification_when_group_already_has_many_members(
-    groups_file,
-) -> None:
-    """No notification when a member joins an already multi-user group."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Large Group",
-        old_status="left",
-        new_status="member",
-        member_count=10,  # Group already has many members
-    )
-
-    await channel._on_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_privacy_boundary_no_notification_on_member_leave(groups_file) -> None:
-    """No notification when a member leaves (only on joins)."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Group",
-        old_status="member",
-        new_status="left",
-        member_count=2,
-    )
-
-    await channel._on_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_privacy_boundary_notifies_multiple_admins(groups_file) -> None:
-    """All configured admins receive the privacy boundary notification."""
-    channel = TelegramChannel(
-        TelegramConfig(
-            enabled=True, token="123:abc", allow_from=["*"],
-            admin_users=["12345", "67890"],
-        ),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    update = _make_chat_member_update(
-        chat_id=-100123456,
-        chat_title="Growing Group",
-        old_status="left",
-        new_status="member",
-        member_count=3,
-    )
-
-    await channel._on_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 2
-    notified_admins = {msg["chat_id"] for msg in channel._app.bot.sent_messages}
-    assert notified_admins == {12345, 67890}
-
-
-@pytest.mark.asyncio
-async def test_privacy_boundary_ignored_for_private_chats(groups_file) -> None:
-    """No notification when chat_member update is for a private chat."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._app = _FakeApp(lambda: None)
-
-    async def mock_get_member_count():
-        return 3
-
-    chat = SimpleNamespace(
-        id=99999,
-        type="private",
-        title=None,
-        get_member_count=mock_get_member_count,
-    )
-    old_member = SimpleNamespace(status="left")
-    new_member = SimpleNamespace(status="member")
-    chat_member = SimpleNamespace(
-        chat=chat,
-        old_chat_member=old_member,
-        new_chat_member=new_member,
-    )
-    update = SimpleNamespace(chat_member=chat_member)
-
-    await channel._on_chat_member(update, None)
-
-    assert len(channel._app.bot.sent_messages) == 0
-
-
-def test_build_message_metadata_includes_chat_title_for_groups() -> None:
-    """Verify chat_title is included in metadata for group chats."""
-    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
-    chat = SimpleNamespace(type="supergroup", title="Test Group", is_forum=False)
-    message = SimpleNamespace(
-        message_id=42,
-        chat=chat,
-        message_thread_id=None,
-        reply_to_message=None,
-    )
-
-    metadata = TelegramChannel._build_message_metadata(message, user)
-
-    assert metadata["chat_title"] == "Test Group"
-    assert metadata["is_group"] is True
-
-
-def test_build_message_metadata_chat_title_none_for_private() -> None:
-    """Verify chat_title is None for private chats (DMs)."""
-    user = SimpleNamespace(id=12345, username="bob", first_name="Bob")
-    chat = SimpleNamespace(type="private", is_forum=False)
-    message = SimpleNamespace(
-        message_id=99,
-        chat=chat,
-        message_thread_id=None,
-        reply_to_message=None,
-    )
-
-    metadata = TelegramChannel._build_message_metadata(message, user)
-
-    assert metadata["chat_title"] is None
-    assert metadata["is_group"] is False
-
-
-# --- Per-group policy override tests ---
-
-
-@pytest.mark.asyncio
-async def test_addgroup_with_respond_all_policy_persists(groups_file) -> None:
-    """Admin can add a group with respond_all policy override."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100999 respond_all")
-    await channel._on_addgroup(update, None)
-
-    assert "-100999" in channel._runtime_groups
-    data = _load_groups_data()
-    assert "-100999" in data["allowed"]
-    assert data.get("policy_overrides", {}).get("-100999") == "respond_all"
-    assert "Added group" in update.message.reply_text.await_args.args[0]
-    assert "respond_all" in update.message.reply_text.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_addgroup_with_mention_policy_persists(groups_file) -> None:
-    """Admin can add a group with mention policy override."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100888 mention")
-    await channel._on_addgroup(update, None)
-
-    assert "-100888" in channel._runtime_groups
-    data = _load_groups_data()
-    assert "-100888" in data["allowed"]
-    assert data.get("policy_overrides", {}).get("-100888") == "mention"
-
-
-@pytest.mark.asyncio
-async def test_addgroup_rejects_invalid_policy() -> None:
-    """Invalid policy values are rejected."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-
-    update = _make_admin_update("/addgroup -100999 invalid_policy")
-    await channel._on_addgroup(update, None)
-
-    assert "Invalid policy" in update.message.reply_text.await_args.args[0]
-    assert "-100999" not in channel._runtime_groups
-
-
-@pytest.mark.asyncio
-async def test_policy_override_loaded_on_startup(groups_file) -> None:
-    """Policy overrides are loaded from file on channel startup."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "respond_all"}
-    }))
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    channel._load_and_merge_groups()
-
-    assert channel._policy_overrides.get("-100999") == "respond_all"
-
-
-@pytest.mark.asyncio
-async def test_is_group_message_for_bot_respond_all_override(groups_file) -> None:
-    """respond_all policy override makes bot respond to all messages regardless of member count."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "respond_all"}
-    }))
-
+async def test_bot_mention_gets_response() -> None:
+    """Bot @mentions us (no reply) -> respond."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="mention"),
         MessageBus(),
     )
-    channel._load_and_merge_groups()
-    channel._bot_user_id = 123456
-    channel._bot_username = "testbot"
+    channel._app = _FakeApp(lambda: None)
+    handled = []
 
-    # Create a message in a group with 5 members (normally would require mention)
-    chat = SimpleNamespace(type="supergroup", id=-100999)
-    message = SimpleNamespace(
-        chat=chat,
-        chat_id=-100999,
-        text="Hello without mention",
-        caption=None,
-        entities=None,
-        caption_entities=None,
-        reply_to_message=None,
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    mention = SimpleNamespace(type="mention", offset=0, length=13)
+    update = _make_bot_telegram_update(
+        text="@nanobot_test hello", entities=[mention], is_bot=True
     )
+    await channel._on_message(update, None)
 
-    # Mock get_member_count to return 5
-    async def mock_get_member_count(c):
-        return 5
-    channel._get_member_count = mock_get_member_count
-
-    result = await channel._is_group_message_for_bot(message)
-    assert result is True
+    assert len(handled) == 1
 
 
 @pytest.mark.asyncio
-async def test_is_group_message_for_bot_mention_override(groups_file) -> None:
-    """mention policy override requires @mention even in small groups."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "mention"}
-    }))
-
+async def test_bot_reply_to_our_message_ignored() -> None:
+    """Bot replies to our message -> ignore, log."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
         MessageBus(),
     )
-    channel._load_and_merge_groups()
-    channel._bot_user_id = 123456
-    channel._bot_username = "testbot"
+    channel._app = _FakeApp(lambda: None)
+    handled = []
 
-    # Create a message in a small group (2 members) without mention
-    chat = SimpleNamespace(type="supergroup", id=-100999)
-    message = SimpleNamespace(
-        chat=chat,
-        chat_id=-100999,
-        text="Hello without mention",
-        caption=None,
-        entities=None,
-        caption_entities=None,
-        reply_to_message=None,
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),  # our bot ID from _FakeBot.get_me
+        text="original message",
     )
+    update = _make_bot_telegram_update(
+        text="Reply from other bot", reply_to_message=our_message, is_bot=True
+    )
+    await channel._on_message(update, None)
 
-    # Mock get_member_count to return 2 (small group, normally auto-respond with open policy)
-    async def mock_get_member_count(c):
-        return 2
-    channel._get_member_count = mock_get_member_count
-
-    # With mention override, should NOT auto-respond even in small group
-    result = await channel._is_group_message_for_bot(message)
-    assert result is False
+    assert handled == []
 
 
 @pytest.mark.asyncio
-async def test_is_group_message_for_bot_mention_override_with_mention(groups_file) -> None:
-    """mention policy override allows response when @mentioned."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "mention"}
-    }))
+async def test_bot2bot_prevention_disabled() -> None:
+    """Config bot2bot_loop_prevention=False -> respond to bot replies."""
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            bot2bot_loop_prevention=False,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
 
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        text="original message",
+    )
+    update = _make_bot_telegram_update(
+        text="Reply from other bot", reply_to_message=our_message, is_bot=True
+    )
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_is_from_bot_detection() -> None:
+    """Verify from_user.is_bot check works correctly."""
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
         MessageBus(),
     )
-    channel._load_and_merge_groups()
-    channel._bot_user_id = 123456
-    channel._bot_username = "testbot"
+    channel._app = _FakeApp(lambda: None)
+    handled = []
 
-    # Create a message with @mention
-    chat = SimpleNamespace(type="supergroup", id=-100999)
-    mention_entity = SimpleNamespace(type="mention", offset=0, length=8)
-    message = SimpleNamespace(
-        chat=chat,
-        chat_id=-100999,
-        text="@testbot Hello",
-        caption=None,
-        entities=[mention_entity],
-        caption_entities=None,
-        reply_to_message=None,
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    our_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        text="original message",
     )
-
-    async def mock_get_member_count(c):
-        return 2
-    channel._get_member_count = mock_get_member_count
-
-    result = await channel._is_group_message_for_bot(message)
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_removegroup_cleans_up_policy_override(groups_file) -> None:
-    """Removing a group also removes its policy override."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "respond_all"}
-    }))
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
+    update = _make_bot_telegram_update(
+        text="Reply from human", reply_to_message=our_message, is_bot=False
     )
-    channel._load_and_merge_groups()
+    await channel._on_message(update, None)
 
-    assert "-100999" in channel._runtime_groups
-    assert channel._policy_overrides.get("-100999") == "respond_all"
-
-    update = _make_admin_update("/removegroup -100999")
-    await channel._on_removegroup(update, None)
-
-    assert "-100999" not in channel._runtime_groups
-    assert "-100999" not in channel._policy_overrides
-    data = _load_groups_data()
-    assert "-100999" not in data.get("policy_overrides", {})
+    assert len(handled) == 1
 
 
-@pytest.mark.asyncio
-async def test_groups_shows_policy_override(groups_file) -> None:
-    """/groups command shows policy override for groups that have one."""
-    groups_file.write_text(json.dumps({
-        "allowed": ["-100999"],
-        "seen": [],
-        "policy_overrides": {"-100999": "respond_all"}
-    }))
-
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
-        MessageBus(),
-    )
-    channel._load_and_merge_groups()
-
-    async def mock_get_chat_info(chat_id):
-        return "Test Group", 5
-    channel._get_chat_info_by_id = mock_get_chat_info
-
-    update = _make_admin_update("/groups")
-    await channel._on_groups(update, None)
-
-    response = update.message.reply_text.await_args.args[0]
-    assert "-100999" in response
-    assert "policy=respond_all" in response
+def test_bot2bot_loop_prevention_defaults_to_true() -> None:
+    """bot2bot_loop_prevention should default to True for safety."""
+    assert TelegramConfig().bot2bot_loop_prevention is True

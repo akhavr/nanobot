@@ -365,6 +365,8 @@ class TelegramConfig(Base):
     streaming: bool = True
     # Enable inline keyboard buttons in Telegram messages.
     inline_keyboards: bool = False
+    # Prevent bot-to-bot reply loops: if a bot replies to our message, ignore it.
+    bot2bot_loop_prevention: bool = True
     stream_edit_interval: float = Field(default=_STREAM_EDIT_INTERVAL_DEFAULT, ge=0.1)
     admin_users: list[str] = Field(default_factory=list)
     group_allow_all: bool = False
@@ -1598,6 +1600,18 @@ class TelegramChannel(BaseChannel):
             self._track_group_member(str_chat_id, user.id)
         elif not self.is_allowed(sender_id, is_dm=is_dm):
             return
+
+        # Bot-to-bot loop prevention: if a bot replies to our message, ignore it.
+        is_from_bot = user and getattr(user, "is_bot", False)
+        if is_from_bot and self.config.bot2bot_loop_prevention:
+            reply_to = getattr(message, "reply_to_message", None)
+            if reply_to:
+                bot_id, _ = await self._ensure_bot_identity()
+                reply_from = getattr(reply_to, "from_user", None)
+                if bot_id and reply_from and getattr(reply_from, "id", None) == bot_id:
+                    text_preview = (message.text or message.caption or "")[:50]
+                    self.logger.info("Ignoring bot reply to prevent loop: {}", text_preview)
+                    return
 
         self._remember_thread_context(message)
 
