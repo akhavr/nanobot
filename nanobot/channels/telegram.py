@@ -425,6 +425,7 @@ class TelegramChannel(BaseChannel):
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
         self._runtime_groups: set[str] = set(self.config.group_allow_from or [])
+        self._policy_overrides: dict[str, str] = {}  # group_id -> policy ("respond_all" or "mention")
 
     def is_allowed(self, sender_id: str, *, is_dm: bool = False) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching.
@@ -547,6 +548,9 @@ class TelegramChannel(BaseChannel):
         persisted = _load_persisted_groups()
         config_groups = self.config.group_allow_from or []
         self._runtime_groups = set(config_groups) | set(persisted)
+        # Load policy overrides
+        data = _load_groups_data()
+        self._policy_overrides = data.get("policy_overrides", {})
 
     def _get_effective_groups(self) -> list[str]:
         """Return effective group allowlist (config + persisted, deduplicated)."""
@@ -1073,7 +1077,15 @@ class TelegramChannel(BaseChannel):
         await message.reply_text(build_help_text())
 
     async def _on_addgroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /addgroup command to add a group to the allowlist (admin only)."""
+        """Handle /addgroup command to add a group to the allowlist (admin only).
+
+        Syntax:
+            /addgroup <group_id> [policy]
+
+        Where policy is optional and can be:
+            respond_all - respond to all messages without @mention
+            mention - require @mention even in small groups
+        """
         if not update.message or not update.effective_user:
             return
         sender_id = self._sender_id(update.effective_user)
@@ -1086,29 +1098,61 @@ class TelegramChannel(BaseChannel):
         text = update.message.text or ""
         parts = text.split(maxsplit=1)
         arg = parts[1].strip() if len(parts) > 1 else ""
+        # Handle @bot suffix in command
         if "@" in arg.split()[0] if arg else False:
             arg = " ".join(arg.split()[1:]) if len(arg.split()) > 1 else ""
 
-        group_id = _parse_group_id(arg)
+        # Parse group_id and optional policy
+        arg_parts = arg.split()
+        if not arg_parts:
+            await update.message.reply_text(
+                "Usage: /addgroup <group_id> [policy]\n"
+                "Example: /addgroup -100123456789\n"
+                "         /addgroup -100123456789 respond_all\n"
+                "         /addgroup -100123456789 mention"
+            )
+            return
+
+        group_id = _parse_group_id(arg_parts[0])
         if not group_id:
             await update.message.reply_text(
-                "Usage: /addgroup <group_id>\n"
+                "Usage: /addgroup <group_id> [policy]\n"
                 "Example: /addgroup -100123456789"
             )
             return
+
+        policy: str | None = None
+        if len(arg_parts) > 1:
+            policy = arg_parts[1].lower()
+            if policy not in ("respond_all", "mention"):
+                await update.message.reply_text(
+                    f"Invalid policy '{arg_parts[1]}'. Valid options: respond_all, mention"
+                )
+                return
 
         if group_id in self._runtime_groups:
             await update.message.reply_text(f"Group {group_id} is already in the allowlist.")
             return
 
+        # Add to persisted groups
         persisted = _load_persisted_groups()
         if group_id not in persisted:
             persisted.append(group_id)
             _save_persisted_groups(persisted)
 
+        # Save policy override if specified
+        if policy:
+            data = _load_groups_data()
+            if "policy_overrides" not in data:
+                data["policy_overrides"] = {}
+            data["policy_overrides"][group_id] = policy
+            _save_groups_data(data)
+            self._policy_overrides[group_id] = policy
+
         self._runtime_groups.add(group_id)
-        await update.message.reply_text(f"Added group {group_id} to the allowlist.")
-        self.logger.info("Admin {} added group {} to allowlist", sender_id, group_id)
+        policy_note = f" with {policy} policy" if policy else ""
+        await update.message.reply_text(f"Added group {group_id} to the allowlist{policy_note}.")
+        self.logger.info("Admin {} added group {} to allowlist (policy={})", sender_id, group_id, policy)
 
     async def _on_removegroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /removegroup command to remove a group from the allowlist (admin only)."""
@@ -1152,6 +1196,14 @@ class TelegramChannel(BaseChannel):
             persisted.remove(group_id)
             _save_persisted_groups(persisted)
 
+        # Remove policy override if present
+        if group_id in self._policy_overrides:
+            data = _load_groups_data()
+            if "policy_overrides" in data and group_id in data["policy_overrides"]:
+                del data["policy_overrides"][group_id]
+                _save_groups_data(data)
+            del self._policy_overrides[group_id]
+
         self._runtime_groups.discard(group_id)
         await update.message.reply_text(f"Removed group {group_id} from the allowlist.")
         self.logger.info("Admin {} removed group {} from allowlist", sender_id, group_id)
@@ -1177,14 +1229,16 @@ class TelegramChannel(BaseChannel):
             lines.append("Allowed groups:")
             for gid in sorted(self._runtime_groups):
                 source = "config" if gid in config_groups else "persisted"
+                policy = self._policy_overrides.get(gid)
+                policy_part = f", policy={policy}" if policy else ""
                 try:
                     chat_id_int = int(gid)
                     name, member_count = await self._get_chat_info_by_id(chat_id_int)
                     name_part = f" — {name}" if name else ""
                     members_part = f", {member_count} members" if member_count else ""
-                    lines.append(f"  {gid}{name_part} ({source}{members_part})")
+                    lines.append(f"  {gid}{name_part} ({source}{members_part}{policy_part})")
                 except ValueError:
-                    lines.append(f"  {gid} ({source})")
+                    lines.append(f"  {gid} ({source}{policy_part})")
         else:
             lines.append("Allowed groups: (none)")
 
@@ -1393,6 +1447,10 @@ class TelegramChannel(BaseChannel):
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot.
 
+        Policy precedence:
+        1. Per-group policy override (respond_all/mention) takes priority
+        2. Otherwise, use global group_policy setting
+
         When group_policy is "open" and group is in allowed list:
         - If member_count <= 2 (1:1 chat): respond to all messages
         - If member_count > 2 (larger group): require @mention or reply to bot
@@ -1401,7 +1459,38 @@ class TelegramChannel(BaseChannel):
         if message.chat.type == "private":
             return True
 
-        in_allowed_group = not self._runtime_groups or str(message.chat_id) in self._runtime_groups
+        group_id_str = str(message.chat_id)
+        in_allowed_group = not self._runtime_groups or group_id_str in self._runtime_groups
+
+        # Check per-group policy override first
+        policy_override = self._policy_overrides.get(group_id_str)
+        if policy_override == "respond_all":
+            # respond_all: always respond to messages in this group
+            return True
+        if policy_override == "mention":
+            # mention: always require @mention, skip member count logic
+            bot_id, bot_username = await self._ensure_bot_identity()
+            if bot_username:
+                text = message.text or ""
+                caption = message.caption or ""
+                if self._has_mention_entity(
+                    text,
+                    getattr(message, "entities", None),
+                    bot_username,
+                    bot_id,
+                ):
+                    return True
+                if self._has_mention_entity(
+                    caption,
+                    getattr(message, "caption_entities", None),
+                    bot_username,
+                    bot_id,
+                ):
+                    return True
+            reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+            if bot_id and reply_user and reply_user.id == bot_id:
+                return True
+            return False
 
         # Smart open policy: auto-respond only in 1:1 groups (user + bot)
         if self.config.group_policy == "open" and in_allowed_group:

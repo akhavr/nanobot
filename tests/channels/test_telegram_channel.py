@@ -3179,3 +3179,244 @@ def test_build_message_metadata_chat_title_none_for_private() -> None:
 
     assert metadata["chat_title"] is None
     assert metadata["is_group"] is False
+
+
+# --- Per-group policy override tests ---
+
+
+@pytest.mark.asyncio
+async def test_addgroup_with_respond_all_policy_persists(groups_file) -> None:
+    """Admin can add a group with respond_all policy override."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/addgroup -100999 respond_all")
+    await channel._on_addgroup(update, None)
+
+    assert "-100999" in channel._runtime_groups
+    data = _load_groups_data()
+    assert "-100999" in data["allowed"]
+    assert data.get("policy_overrides", {}).get("-100999") == "respond_all"
+    assert "Added group" in update.message.reply_text.await_args.args[0]
+    assert "respond_all" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_addgroup_with_mention_policy_persists(groups_file) -> None:
+    """Admin can add a group with mention policy override."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/addgroup -100888 mention")
+    await channel._on_addgroup(update, None)
+
+    assert "-100888" in channel._runtime_groups
+    data = _load_groups_data()
+    assert "-100888" in data["allowed"]
+    assert data.get("policy_overrides", {}).get("-100888") == "mention"
+
+
+@pytest.mark.asyncio
+async def test_addgroup_rejects_invalid_policy() -> None:
+    """Invalid policy values are rejected."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+
+    update = _make_admin_update("/addgroup -100999 invalid_policy")
+    await channel._on_addgroup(update, None)
+
+    assert "Invalid policy" in update.message.reply_text.await_args.args[0]
+    assert "-100999" not in channel._runtime_groups
+
+
+@pytest.mark.asyncio
+async def test_policy_override_loaded_on_startup(groups_file) -> None:
+    """Policy overrides are loaded from file on channel startup."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "respond_all"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    assert channel._policy_overrides.get("-100999") == "respond_all"
+
+
+@pytest.mark.asyncio
+async def test_is_group_message_for_bot_respond_all_override(groups_file) -> None:
+    """respond_all policy override makes bot respond to all messages regardless of member count."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "respond_all"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+    channel._bot_user_id = 123456
+    channel._bot_username = "testbot"
+
+    # Create a message in a group with 5 members (normally would require mention)
+    chat = SimpleNamespace(type="supergroup", id=-100999)
+    message = SimpleNamespace(
+        chat=chat,
+        chat_id=-100999,
+        text="Hello without mention",
+        caption=None,
+        entities=None,
+        caption_entities=None,
+        reply_to_message=None,
+    )
+
+    # Mock get_member_count to return 5
+    async def mock_get_member_count(c):
+        return 5
+    channel._get_member_count = mock_get_member_count
+
+    result = await channel._is_group_message_for_bot(message)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_group_message_for_bot_mention_override(groups_file) -> None:
+    """mention policy override requires @mention even in small groups."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "mention"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+    channel._bot_user_id = 123456
+    channel._bot_username = "testbot"
+
+    # Create a message in a small group (2 members) without mention
+    chat = SimpleNamespace(type="supergroup", id=-100999)
+    message = SimpleNamespace(
+        chat=chat,
+        chat_id=-100999,
+        text="Hello without mention",
+        caption=None,
+        entities=None,
+        caption_entities=None,
+        reply_to_message=None,
+    )
+
+    # Mock get_member_count to return 2 (small group, normally auto-respond with open policy)
+    async def mock_get_member_count(c):
+        return 2
+    channel._get_member_count = mock_get_member_count
+
+    # With mention override, should NOT auto-respond even in small group
+    result = await channel._is_group_message_for_bot(message)
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_is_group_message_for_bot_mention_override_with_mention(groups_file) -> None:
+    """mention policy override allows response when @mentioned."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "mention"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+    channel._bot_user_id = 123456
+    channel._bot_username = "testbot"
+
+    # Create a message with @mention
+    chat = SimpleNamespace(type="supergroup", id=-100999)
+    mention_entity = SimpleNamespace(type="mention", offset=0, length=8)
+    message = SimpleNamespace(
+        chat=chat,
+        chat_id=-100999,
+        text="@testbot Hello",
+        caption=None,
+        entities=[mention_entity],
+        caption_entities=None,
+        reply_to_message=None,
+    )
+
+    async def mock_get_member_count(c):
+        return 2
+    channel._get_member_count = mock_get_member_count
+
+    result = await channel._is_group_message_for_bot(message)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_removegroup_cleans_up_policy_override(groups_file) -> None:
+    """Removing a group also removes its policy override."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "respond_all"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    assert "-100999" in channel._runtime_groups
+    assert channel._policy_overrides.get("-100999") == "respond_all"
+
+    update = _make_admin_update("/removegroup -100999")
+    await channel._on_removegroup(update, None)
+
+    assert "-100999" not in channel._runtime_groups
+    assert "-100999" not in channel._policy_overrides
+    data = _load_groups_data()
+    assert "-100999" not in data.get("policy_overrides", {})
+
+
+@pytest.mark.asyncio
+async def test_groups_shows_policy_override(groups_file) -> None:
+    """/groups command shows policy override for groups that have one."""
+    groups_file.write_text(json.dumps({
+        "allowed": ["-100999"],
+        "seen": [],
+        "policy_overrides": {"-100999": "respond_all"}
+    }))
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], admin_users=["12345"]),
+        MessageBus(),
+    )
+    channel._load_and_merge_groups()
+
+    async def mock_get_chat_info(chat_id):
+        return "Test Group", 5
+    channel._get_chat_info_by_id = mock_get_chat_info
+
+    update = _make_admin_update("/groups")
+    await channel._on_groups(update, None)
+
+    response = update.message.reply_text.await_args.args[0]
+    assert "-100999" in response
+    assert "policy=respond_all" in response
