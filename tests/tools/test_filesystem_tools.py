@@ -3,6 +3,7 @@
 import pytest
 
 from nanobot.agent.tools.filesystem import (
+    CopyFileTool,
     EditFileTool,
     ListDirTool,
     ReadFileTool,
@@ -407,3 +408,220 @@ class TestWorkspaceRestriction:
         assert "Error" in result
         assert "outside" in result.lower()
         assert skill_file.read_text() == "# Weather\nOriginal content."
+
+
+# ---------------------------------------------------------------------------
+# CopyFileTool
+# ---------------------------------------------------------------------------
+
+class TestCopyFileTool:
+
+    @pytest.fixture()
+    def tool(self, tmp_path):
+        return CopyFileTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_copy_file_basic(self, tool, tmp_path):
+        """Copy file from temp to workspace, verify content matches."""
+        import json
+
+        source = tmp_path / "source.txt"
+        source.write_text("Hello, World!", encoding="utf-8")
+        dest = tmp_path / "dest.txt"
+
+        result = await tool.execute(source=str(source), dest=str(dest))
+        data = json.loads(result)
+
+        assert data["path"] == str(dest)
+        assert data["size"] == 13
+        assert dest.read_text() == "Hello, World!"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_dest_is_directory(self, tool, tmp_path):
+        """When dest is dir, use source filename."""
+        import json
+
+        source = tmp_path / "document.md"
+        source.write_text("# My Doc", encoding="utf-8")
+        dest_dir = tmp_path / "docs"
+        dest_dir.mkdir()
+
+        result = await tool.execute(source=str(source), dest=str(dest_dir))
+        data = json.loads(result)
+
+        assert data["path"] == str(dest_dir / "document.md")
+        assert (dest_dir / "document.md").read_text() == "# My Doc"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_overwrite_false_fails(self, tool, tmp_path):
+        """dest exists, overwrite=false -> error."""
+        source = tmp_path / "src.txt"
+        source.write_text("new content", encoding="utf-8")
+        dest = tmp_path / "existing.txt"
+        dest.write_text("old content", encoding="utf-8")
+
+        result = await tool.execute(source=str(source), dest=str(dest), overwrite=False)
+
+        assert "Error" in result
+        assert "already exists" in result
+        assert dest.read_text() == "old content"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_overwrite_true_succeeds(self, tool, tmp_path):
+        """dest exists, overwrite=true -> success."""
+        import json
+
+        source = tmp_path / "src.txt"
+        source.write_text("new content", encoding="utf-8")
+        dest = tmp_path / "existing.txt"
+        dest.write_text("old content", encoding="utf-8")
+
+        result = await tool.execute(source=str(source), dest=str(dest), overwrite=True)
+        data = json.loads(result)
+
+        assert data["path"] == str(dest)
+        assert dest.read_text() == "new content"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_create_parents(self, tool, tmp_path):
+        """Parent dirs don't exist, create_parents=true -> creates them."""
+        import json
+
+        source = tmp_path / "source.txt"
+        source.write_text("content", encoding="utf-8")
+        dest = tmp_path / "a" / "b" / "c" / "dest.txt"
+
+        result = await tool.execute(source=str(source), dest=str(dest), create_parents=True)
+        data = json.loads(result)
+
+        assert data["path"] == str(dest)
+        assert dest.exists()
+        assert dest.read_text() == "content"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_no_create_parents_fails(self, tool, tmp_path):
+        """Parent dirs missing, create_parents=false -> error."""
+        source = tmp_path / "source.txt"
+        source.write_text("content", encoding="utf-8")
+        dest = tmp_path / "nonexistent" / "dest.txt"
+
+        result = await tool.execute(source=str(source), dest=str(dest), create_parents=False)
+
+        assert "Error" in result
+        assert "Parent directory does not exist" in result
+        assert not dest.exists()
+
+    @pytest.mark.asyncio
+    async def test_copy_file_source_outside_allowlist(self, tmp_path, monkeypatch):
+        """Source not in allowlist -> error."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        source = outside / "secret.txt"
+        source.write_text("secret data", encoding="utf-8")
+
+        # Mock get_media_dir to return a dir that doesn't contain our source
+        monkeypatch.setattr("nanobot.agent.tools.path_utils.get_media_dir", lambda: workspace / "media")
+
+        tool = CopyFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(source=str(source), dest=str(workspace / "copy.txt"))
+
+        assert "Error" in result
+        assert "outside" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_copy_file_returns_path_and_size(self, tool, tmp_path):
+        """Verify return value format."""
+        import json
+
+        source = tmp_path / "data.bin"
+        source.write_bytes(b"\x00" * 1024)
+
+        result = await tool.execute(source=str(source), dest=str(tmp_path / "copy.bin"))
+        data = json.loads(result)
+
+        assert "path" in data
+        assert "size" in data
+        assert data["size"] == 1024
+        assert data["path"].endswith("copy.bin")
+
+    @pytest.mark.asyncio
+    async def test_copy_file_source_from_media_dir(self, tmp_path, monkeypatch):
+        """Source in media dir should be allowed."""
+        import json
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+        source = media_dir / "uploaded.pdf"
+        source.write_bytes(b"%PDF-fake")
+
+        monkeypatch.setattr("nanobot.agent.tools.path_utils.get_media_dir", lambda: media_dir)
+
+        tool = CopyFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(source=str(source), dest=str(workspace / "doc.pdf"))
+        data = json.loads(result)
+
+        assert data["path"] == str(workspace / "doc.pdf")
+        assert (workspace / "doc.pdf").read_bytes() == b"%PDF-fake"
+
+    @pytest.mark.asyncio
+    async def test_copy_file_dest_outside_workspace_fails(self, tmp_path, monkeypatch):
+        """Dest outside workspace -> error."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        source = workspace / "file.txt"
+        source.write_text("data", encoding="utf-8")
+
+        monkeypatch.setattr("nanobot.agent.tools.path_utils.get_media_dir", lambda: workspace / "media")
+
+        tool = CopyFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(source=str(source), dest=str(outside / "stolen.txt"))
+
+        assert "Error" in result
+        assert "outside" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_copy_file_source_not_found(self, tool, tmp_path):
+        """Source file doesn't exist -> error."""
+        result = await tool.execute(
+            source=str(tmp_path / "nonexistent.txt"),
+            dest=str(tmp_path / "dest.txt"),
+        )
+
+        assert "Error" in result
+        assert "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_copy_file_source_is_directory(self, tool, tmp_path):
+        """Source is a directory -> error."""
+        source_dir = tmp_path / "src_dir"
+        source_dir.mkdir()
+
+        result = await tool.execute(
+            source=str(source_dir),
+            dest=str(tmp_path / "dest.txt"),
+        )
+
+        assert "Error" in result
+        assert "not a file" in result
+
+    @pytest.mark.asyncio
+    async def test_copy_file_missing_source(self, tool):
+        """Missing source param -> error."""
+        result = await tool.execute(dest="/some/path")
+        assert "Error" in result
+        assert "source" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_copy_file_missing_dest(self, tool, tmp_path):
+        """Missing dest param -> error."""
+        source = tmp_path / "file.txt"
+        source.write_text("x", encoding="utf-8")
+        result = await tool.execute(source=str(source))
+        assert "Error" in result
+        assert "dest" in result.lower()

@@ -9,7 +9,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
-from nanobot.agent.tools.path_utils import resolve_workspace_path
+from nanobot.agent.tools.path_utils import is_under, resolve_workspace_path
 from nanobot.agent.tools.schema import (
     BooleanSchema,
     IntegerSchema,
@@ -1000,3 +1000,115 @@ class ListDirTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
+
+
+# ---------------------------------------------------------------------------
+# copy_file
+# ---------------------------------------------------------------------------
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        source=StringSchema("The source file path to copy from"),
+        dest=StringSchema("The destination path (file or directory)"),
+        overwrite=BooleanSchema(
+            description="Overwrite if destination exists (default false)",
+            default=False,
+        ),
+        create_parents=BooleanSchema(
+            description="Create parent directories if they don't exist (default true)",
+            default=True,
+        ),
+        required=["source", "dest"],
+    )
+)
+class CopyFileTool(_FsTool):
+    """Copy a file from source to destination without regenerating content."""
+    _scopes = {"core", "subagent"}
+
+    @property
+    def name(self) -> str:
+        return "copy_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Copy a file from source to destination. Useful for saving uploaded "
+            "attachments (from /tmp or media directories) to the workspace without "
+            "the LLM needing to regenerate file content. If dest is a directory, "
+            "the source filename is used. Source must be in the workspace or media "
+            "directories; dest must be in the workspace."
+        )
+
+    def _resolve_source(self, path: str) -> Path:
+        """Resolve source path allowing workspace and media directories."""
+        return resolve_workspace_path(
+            path,
+            self._workspace,
+            self._allowed_dir,
+            self._extra_allowed_dirs,
+        )
+
+    def _resolve_dest(self, path: str) -> Path:
+        """Resolve dest path, must be in workspace."""
+        p = Path(path).expanduser()
+        if not p.is_absolute() and self._workspace:
+            p = self._workspace / p
+        resolved = p.resolve()
+        if self._allowed_dir and not is_under(resolved, self._allowed_dir):
+            raise PermissionError(
+                f"Destination {path} is outside workspace {self._allowed_dir}"
+            )
+        return resolved
+
+    async def execute(
+        self,
+        source: str | None = None,
+        dest: str | None = None,
+        overwrite: bool = False,
+        create_parents: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        import json
+        import shutil
+
+        try:
+            if not source:
+                return "Error: source path is required"
+            if not dest:
+                return "Error: dest path is required"
+
+            src_path = self._resolve_source(source)
+            if not src_path.exists():
+                return f"Error: Source file not found: {source}"
+            if not src_path.is_file():
+                return f"Error: Source is not a file: {source}"
+
+            dest_path = self._resolve_dest(dest)
+
+            # If dest is a directory, use the source filename
+            if dest_path.is_dir():
+                dest_path = dest_path / src_path.name
+
+            # Check if dest already exists
+            if dest_path.exists() and not overwrite:
+                return f"Error: Destination already exists: {dest_path}. Set overwrite=true to replace."
+
+            # Create parent directories if needed
+            if not dest_path.parent.exists():
+                if create_parents:
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    return f"Error: Parent directory does not exist: {dest_path.parent}. Set create_parents=true to create."
+
+            # Copy the file
+            shutil.copy2(src_path, dest_path)
+            size = dest_path.stat().st_size
+
+            self._file_states.record_write(dest_path)
+            return json.dumps({"path": str(dest_path), "size": size})
+
+        except PermissionError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error copying file: {e}"
