@@ -63,6 +63,18 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 - Security boundaries: [`.agent/security.md`](.agent/security.md)
 - Common gotchas: [`.agent/gotchas.md`](.agent/gotchas.md)
 
+## Git Remotes (Fork Setup)
+
+This repo is a fork of upstream HKUDS/nanobot. Remotes are configured as:
+
+- `origin` = https://github.com/HKUDS/nanobot.git (upstream, read-only)
+- `fork` = git@github.com:akhavr/nanobot.git (our fork, push here)
+
+**IMPORTANT for nightshift agents:**
+- Do NOT run `git pull origin` — this pulls upstream changes and pollutes the branch
+- The worktree branch should only contain your issue-specific changes
+- If you need to sync with upstream, that's a separate manual operation
+
 ## Branching Strategy
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full two-branch model (`main` vs `nightly`) and PR guidelines.
