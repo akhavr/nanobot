@@ -14,6 +14,7 @@ workspace:
   kind: worktree
   base_branch: main
   root: .worktrees
+  fetch_remote: none  # fork workflow - compare against local main, not origin
 
 notifications:
   - kind: telegram
