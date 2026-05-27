@@ -15,7 +15,7 @@ except ImportError:
 
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import TelegramChannel, TelegramConfig
-from nanobot.config.schema import Config, EvalConfig
+from nanobot.config.schema import EvalConfig
 
 
 def _make_eval_config(group_id: str | None = None, enabled: bool = True) -> EvalConfig:
@@ -37,17 +37,54 @@ def _make_mock_message(
     )
 
 
+def _make_forward_origin_user(user_id: int, forward_date: datetime):
+    """Create a MessageOriginUser-like object for testing."""
+    return SimpleNamespace(
+        date=forward_date,
+        sender_user=SimpleNamespace(id=user_id),
+    )
+
+
+def _make_forward_origin_chat(chat_id: int, forward_date: datetime):
+    """Create a MessageOriginChat-like object for testing."""
+    return SimpleNamespace(
+        date=forward_date,
+        sender_chat=SimpleNamespace(id=chat_id),
+    )
+
+
+def _make_forward_origin_channel(chat_id: int, forward_date: datetime):
+    """Create a MessageOriginChannel-like object for testing."""
+    return SimpleNamespace(
+        date=forward_date,
+        chat=SimpleNamespace(id=chat_id),
+    )
+
+
+def _make_forward_origin_hidden_user(forward_date: datetime):
+    """Create a MessageOriginHiddenUser-like object for testing."""
+    return SimpleNamespace(
+        date=forward_date,
+    )
+
+
+def _make_forwarded_message_with_origin(forward_origin, text: str | None = None):
+    """Create a forwarded message using forward_origin (new API)."""
+    return SimpleNamespace(
+        text=text,
+        caption=None,
+        forward_origin=forward_origin,
+    )
+
+
 def _make_forwarded_message(
     forward_from_chat_id: int,
     forward_date: datetime,
     text: str | None = None,
 ):
-    return SimpleNamespace(
-        text=text,
-        caption=None,
-        forward_from_chat=SimpleNamespace(id=forward_from_chat_id),
-        forward_date=forward_date,
-    )
+    """Legacy helper - creates message with forward_origin for compatibility."""
+    forward_origin = _make_forward_origin_chat(forward_from_chat_id, forward_date)
+    return _make_forwarded_message_with_origin(forward_origin, text)
 
 
 @pytest.fixture
@@ -125,8 +162,7 @@ async def test_try_eval_capture_reply_not_forwarded(telegram_channel):
     reply = SimpleNamespace(
         text="some reply",
         caption=None,
-        forward_from_chat=None,
-        forward_date=None,
+        forward_origin=None,
     )
 
     with patch("nanobot.config.loader.load_config", return_value=mock_config):
@@ -259,3 +295,243 @@ async def test_handle_eval_capture_no_session_skips(telegram_channel, temp_works
 
     feedback_path = temp_workspace / "evals" / "feedback.jsonl"
     assert not feedback_path.exists(), "No entry should be written when session not found"
+
+
+# ---------------------------------------------------------------------------
+# Tests for forward_origin API (python-telegram-bot v22.7+)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_message_origin_user(telegram_channel, temp_workspace):
+    """Eval capture works with MessageOriginUser (forwarded from DM)."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    forward_date = datetime.now(timezone.utc)
+    forward_origin = _make_forward_origin_user(user_id=456, forward_date=forward_date)
+    reply = _make_forwarded_message_with_origin(forward_origin, text="Bad bot response")
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "telegram_456.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:456", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "assistant", "content": "Bad bot response", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(chat_id=-123, text="Wrong answer", reply_to_message=reply)
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+    assert entry["original_chat_id"] == "456"
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_message_origin_chat(telegram_channel, temp_workspace):
+    """Eval capture works with MessageOriginChat (forwarded from group)."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    forward_date = datetime.now(timezone.utc)
+    forward_origin = _make_forward_origin_chat(chat_id=-456, forward_date=forward_date)
+    reply = _make_forwarded_message_with_origin(forward_origin, text="Bad bot response")
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "telegram_-456.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-456", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "assistant", "content": "Bad bot response", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(chat_id=-123, text="Wrong answer", reply_to_message=reply)
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+    assert entry["original_chat_id"] == "-456"
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_message_origin_channel(telegram_channel, temp_workspace):
+    """Eval capture works with MessageOriginChannel (forwarded from channel)."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    forward_date = datetime.now(timezone.utc)
+    forward_origin = _make_forward_origin_channel(chat_id=-789, forward_date=forward_date)
+    reply = _make_forwarded_message_with_origin(forward_origin, text="Bad bot response")
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "telegram_-789.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-789", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "assistant", "content": "Bad bot response", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(chat_id=-123, text="Wrong answer", reply_to_message=reply)
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+    assert entry["original_chat_id"] == "-789"
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_message_origin_hidden_user(telegram_channel):
+    """Eval capture gracefully skips MessageOriginHiddenUser (no identifiable source)."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+
+    forward_date = datetime.now(timezone.utc)
+    forward_origin = _make_forward_origin_hidden_user(forward_date=forward_date)
+    reply = _make_forwarded_message_with_origin(forward_origin, text="Bad bot response")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(chat_id=-123, text="Wrong answer", reply_to_message=reply)
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is False
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_no_forward_origin(telegram_channel):
+    """Eval capture returns False when reply has no forward_origin."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+
+    reply = SimpleNamespace(
+        text="some reply",
+        caption=None,
+        forward_origin=None,
+    )
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(chat_id=-123, text="explanation", reply_to_message=reply)
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is False
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_stores_feedback(telegram_channel, temp_workspace):
+    """Eval capture stores feedback entry with correct fields."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    forward_date = datetime.now(timezone.utc)
+    forward_origin = _make_forward_origin_chat(chat_id=-456, forward_date=forward_date)
+    reply = _make_forwarded_message_with_origin(forward_origin, text="This is a bad response")
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "telegram_-456.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-456", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "user", "content": "What is 2+2?", "timestamp": forward_date.isoformat()},
+        {"role": "assistant", "content": "This is a bad response", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(
+            chat_id=-123,
+            text="The bot got this completely wrong",
+            reply_to_message=reply,
+        )
+        result = await telegram_channel._try_eval_capture(message)
+        assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+
+    assert entry["original_chat_id"] == "-456"
+    assert entry["bad_message"] == "This is a bad response"
+    assert entry["explanation"] == "The bot got this completely wrong"
+    assert "timestamp" in entry
+    assert "original_timestamp" in entry
+    assert "context" in entry
+    assert "session_file" in entry
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_e2e(telegram_channel, temp_workspace):
+    """E2E test: forward bot message to eval group, reply with explanation, verify feedback.jsonl."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-100")
+    mock_config.workspace_path = temp_workspace
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "telegram_-555.jsonl"
+    forward_date = datetime.now(timezone.utc)
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-555", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "user", "content": "What is the capital of France?", "timestamp": forward_date.isoformat()},
+        {"role": "assistant", "content": "The capital of France is Berlin.", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    forward_origin = _make_forward_origin_chat(chat_id=-555, forward_date=forward_date)
+    forwarded_bot_message = _make_forwarded_message_with_origin(
+        forward_origin, text="The capital of France is Berlin."
+    )
+
+    evaluator_reply = _make_mock_message(
+        chat_id=-100,
+        text="Wrong! The capital of France is Paris, not Berlin.",
+        reply_to_message=forwarded_bot_message,
+    )
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        result = await telegram_channel._try_eval_capture(evaluator_reply)
+
+    assert result is True, "Eval capture should return True for valid eval reply"
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists(), "feedback.jsonl should be created"
+
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+
+    assert entry["original_chat_id"] == "-555"
+    assert entry["bad_message"] == "The capital of France is Berlin."
+    assert entry["explanation"] == "Wrong! The capital of France is Paris, not Berlin."
+    assert "timestamp" in entry
+    assert "original_timestamp" in entry
+    assert "context" in entry
+    assert len(entry["context"]) >= 1
+    assert any(c["content"] == "What is the capital of France?" for c in entry["context"])
