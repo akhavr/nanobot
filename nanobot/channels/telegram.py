@@ -1498,8 +1498,12 @@ class TelegramChannel(BaseChannel):
         sm = SessionManager(config.workspace_path)
         session_data = sm.read_session_file(session_key)
 
+        if not session_data:
+            self.logger.info("Eval capture: no session found for {}, skipping", session_key)
+            return
+
         context: list[dict[str, str]] = []
-        if session_data and session_data.get("messages"):
+        if session_data.get("messages"):
             messages = session_data["messages"]
             target_ts = forward_date.timestamp()
             matching_idx: int | None = None

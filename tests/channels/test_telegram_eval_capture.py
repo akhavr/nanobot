@@ -168,6 +168,17 @@ async def test_try_eval_capture_success(telegram_channel, temp_workspace):
         text="This is a bad response from the bot",
     )
 
+    sessions_dir = temp_workspace / "sessions"
+    session_file = sessions_dir / "telegram_-456.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-456", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "assistant", "content": "This is a bad response from the bot",
+         "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
     with patch("nanobot.config.loader.load_config", return_value=mock_config):
         message = _make_mock_message(
             chat_id=-123,
@@ -227,3 +238,24 @@ async def test_handle_eval_capture_with_session_context(telegram_channel, temp_w
 
     assert len(entry["context"]) > 0
     assert any(c["content"] == "Hello bot" for c in entry["context"])
+
+
+@pytest.mark.asyncio
+async def test_handle_eval_capture_no_session_skips(telegram_channel, temp_workspace):
+    """Eval capture skips when session file doesn't exist."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    forward_time = datetime.now(timezone.utc)
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        await telegram_channel._handle_eval_capture(
+            original_chat_id="-456",
+            forward_date=forward_time,
+            bad_message_text="Bad answer here",
+            explanation="This answer is wrong",
+        )
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert not feedback_path.exists(), "No entry should be written when session not found"
