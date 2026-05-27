@@ -1446,6 +1446,106 @@ class TelegramChannel(BaseChannel):
                 return True
         return handle in text.lower()
 
+    async def _try_eval_capture(self, message) -> bool:
+        """Detect and handle eval capture: reply to forwarded message in eval group.
+
+        Returns True if this was an eval capture (message should not be processed normally).
+        """
+        from nanobot.config.loader import load_config
+
+        config = load_config()
+        if not config.eval.enabled or not config.eval.group_id:
+            return False
+
+        if str(message.chat_id) != config.eval.group_id:
+            return False
+
+        reply = getattr(message, "reply_to_message", None)
+        if not reply:
+            return False
+
+        forward_chat = getattr(reply, "forward_from_chat", None)
+        forward_date = getattr(reply, "forward_date", None)
+        if not forward_chat or not forward_date:
+            return False
+
+        explanation = message.text or message.caption or ""
+        if not explanation.strip():
+            return False
+
+        await self._handle_eval_capture(
+            original_chat_id=str(forward_chat.id),
+            forward_date=forward_date,
+            bad_message_text=reply.text or reply.caption or "",
+            explanation=explanation,
+        )
+        return True
+
+    async def _handle_eval_capture(
+        self,
+        original_chat_id: str,
+        forward_date: datetime,
+        bad_message_text: str,
+        explanation: str,
+    ) -> None:
+        """Extract context and store eval capture entry."""
+        from nanobot.config.loader import load_config
+        from nanobot.session.manager import SessionManager
+
+        config = load_config()
+        session_key = f"telegram:{original_chat_id}"
+
+        sm = SessionManager(config.workspace_path)
+        session_data = sm.read_session_file(session_key)
+
+        context: list[dict[str, str]] = []
+        if session_data and session_data.get("messages"):
+            messages = session_data["messages"]
+            target_ts = forward_date.timestamp()
+            matching_idx: int | None = None
+            for i, msg in enumerate(messages):
+                msg_ts_str = msg.get("timestamp")
+                if not msg_ts_str:
+                    continue
+                try:
+                    msg_ts = datetime.fromisoformat(msg_ts_str).timestamp()
+                except ValueError:
+                    continue
+                if abs(msg_ts - target_ts) <= 30:
+                    matching_idx = i
+                    break
+
+            if matching_idx is not None:
+                start_idx = max(0, matching_idx - 3)
+                for msg in messages[start_idx : matching_idx + 1]:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            b.get("text", "") for b in content if isinstance(b, dict)
+                        )
+                    if role in ("user", "assistant") and content:
+                        context.append({"role": role, "content": content})
+
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "original_chat_id": original_chat_id,
+            "original_timestamp": forward_date.isoformat(),
+            "bad_message": bad_message_text,
+            "context": context,
+            "explanation": explanation,
+            "session_file": f"telegram_{original_chat_id}.jsonl",
+        }
+
+        evals_dir = config.workspace_path / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        feedback_path = evals_dir / "feedback.jsonl"
+
+        with open(feedback_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        self.logger.info("Captured eval feedback for chat {}", original_chat_id)
+
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot.
 
@@ -1621,6 +1721,10 @@ class TelegramChannel(BaseChannel):
         # Track seen groups for /groups command
         if not is_dm:
             self._track_seen_group(chat_id, getattr(message.chat, "title", None))
+
+        # Eval capture: detect replies to forwarded messages in eval group
+        if await self._try_eval_capture(message):
+            return
 
         if not await self._is_group_message_for_bot(message):
             return

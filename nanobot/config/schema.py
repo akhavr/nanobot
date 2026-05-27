@@ -231,6 +231,13 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
+class EvalConfig(Base):
+    """Eval capture configuration for feedback loop."""
+
+    group_id: str | None = None  # Telegram group ID for eval capture
+    enabled: bool = True
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -302,6 +309,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    eval: EvalConfig = Field(default_factory=EvalConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
