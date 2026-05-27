@@ -511,7 +511,11 @@ class CronService:
         if self._running:
             store = self._load_store()
             store.jobs.append(job)
-            self._save_store()
+            try:
+                self._save_store()
+            except Exception:
+                store.jobs = [j for j in store.jobs if j.id != job.id]
+                raise
             self._arm_timer()
         else:
             self._append_action("add", asdict(job))
@@ -526,9 +530,14 @@ class CronService:
         job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
         job.created_at_ms = now
         job.updated_at_ms = now
+        prev_jobs = store.jobs
         store.jobs = [j for j in store.jobs if j.id != job.id]
         store.jobs.append(job)
-        self._save_store()
+        try:
+            self._save_store()
+        except Exception:
+            store.jobs = prev_jobs
+            raise
         self._arm_timer()
         logger.info("Cron: registered system job '{}' ({})", job.name, job.id)
         return job
@@ -549,7 +558,11 @@ class CronService:
 
         if removed:
             if self._running:
-                self._save_store()
+                try:
+                    self._save_store()
+                except Exception:
+                    store.jobs.append(job)
+                    raise
                 self._arm_timer()
             else:
                 self._append_action("del", {"job_id": job_id})
@@ -563,6 +576,10 @@ class CronService:
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id:
+                prev_enabled = job.enabled
+                prev_next_run = job.state.next_run_at_ms
+                prev_updated_at = job.updated_at_ms
+
                 job.enabled = enabled
                 job.updated_at_ms = _now_ms()
                 if enabled:
@@ -570,7 +587,13 @@ class CronService:
                 else:
                     job.state.next_run_at_ms = None
                 if self._running:
-                    self._save_store()
+                    try:
+                        self._save_store()
+                    except Exception:
+                        job.enabled = prev_enabled
+                        job.state.next_run_at_ms = prev_next_run
+                        job.updated_at_ms = prev_updated_at
+                        raise
                     self._arm_timer()
                 else:
                     self._append_action("update", asdict(job))
@@ -601,6 +624,17 @@ class CronService:
         if job.payload.kind == "system_event":
             return "protected"
 
+        # Snapshot before mutation for rollback
+        prev_name = job.name
+        prev_schedule = job.schedule
+        prev_message = job.payload.message
+        prev_deliver = job.payload.deliver
+        prev_channel = job.payload.channel
+        prev_to = job.payload.to
+        prev_delete_after_run = job.delete_after_run
+        prev_updated_at = job.updated_at_ms
+        prev_next_run = job.state.next_run_at_ms
+
         if schedule is not None:
             _validate_schedule_for_add(schedule)
             job.schedule = schedule
@@ -622,7 +656,19 @@ class CronService:
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
         if self._running:
-            self._save_store()
+            try:
+                self._save_store()
+            except Exception:
+                job.name = prev_name
+                job.schedule = prev_schedule
+                job.payload.message = prev_message
+                job.payload.deliver = prev_deliver
+                job.payload.channel = prev_channel
+                job.payload.to = prev_to
+                job.delete_after_run = prev_delete_after_run
+                job.updated_at_ms = prev_updated_at
+                job.state.next_run_at_ms = prev_next_run
+                raise
             self._arm_timer()
         else:
             self._append_action("update", asdict(job))

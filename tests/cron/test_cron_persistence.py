@@ -164,3 +164,158 @@ def test_full_round_trip_survives_repeated_save_load(tmp_path: Path) -> None:
     s2._load_store()
     assert s2._store is not None
     assert [j.name for j in s2._store.jobs] == ["Daily Loving Message"]
+
+
+# ---------------------------------------------------------------------------
+# Rollback on save failure tests
+# ---------------------------------------------------------------------------
+
+
+def _started_service(tmp_path: Path) -> tuple[CronService, Path]:
+    """Create a started service with one existing job.
+
+    Uses the action log path (service not running) to add a job, then
+    merges to jobs.json and marks the service as running so subsequent
+    operations go through the running-path code.
+    """
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    # Add via action log (not running path)
+    service.add_job(
+        name="existing",
+        schedule=CronSchedule(kind="every", every_ms=60000),
+        message="test",
+    )
+    # Now mark as running and load/merge to populate _store
+    service._running = True
+    service._load_store()
+    # Disable _arm_timer since we're not in an async context
+    service._arm_timer = lambda: None
+    return service, store_path
+
+
+def _failing_atomic_write(path, content):
+    raise IOError("disk full")
+
+
+def test_add_job_rollback_on_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """add_job must rollback in-memory state if _save_store fails."""
+    service, store_path = _started_service(tmp_path)
+    original_disk = store_path.read_bytes()
+    assert len(service._store.jobs) == 1
+
+    monkeypatch.setattr(CronService, "_atomic_write", staticmethod(_failing_atomic_write))
+
+    with pytest.raises(IOError, match="disk full"):
+        service.add_job(
+            name="new",
+            schedule=CronSchedule(kind="every", every_ms=60000),
+            message="test2",
+        )
+
+    # Check in-memory state was rolled back (not just disk)
+    assert len(service._store.jobs) == 1
+    assert service._store.jobs[0].name == "existing"
+    assert store_path.read_bytes() == original_disk
+
+
+def test_remove_job_rollback_on_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """remove_job must rollback in-memory state if _save_store fails."""
+    service, store_path = _started_service(tmp_path)
+    original_disk = store_path.read_bytes()
+    job_id = service._store.jobs[0].id
+
+    monkeypatch.setattr(CronService, "_atomic_write", staticmethod(_failing_atomic_write))
+
+    with pytest.raises(IOError, match="disk full"):
+        service.remove_job(job_id)
+
+    # Check in-memory state was rolled back
+    assert len(service._store.jobs) == 1
+    assert service._store.jobs[0].id == job_id
+    assert store_path.read_bytes() == original_disk
+
+
+def test_enable_job_rollback_on_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """enable_job must rollback in-memory state if _save_store fails."""
+    service, store_path = _started_service(tmp_path)
+    job_id = service._store.jobs[0].id
+    original_enabled = service._store.jobs[0].enabled
+    original_next_run = service._store.jobs[0].state.next_run_at_ms
+    original_updated_at = service._store.jobs[0].updated_at_ms
+    original_disk = store_path.read_bytes()
+
+    monkeypatch.setattr(CronService, "_atomic_write", staticmethod(_failing_atomic_write))
+
+    with pytest.raises(IOError, match="disk full"):
+        service.enable_job(job_id, enabled=False)
+
+    # Check in-memory state was rolled back
+    job = next(j for j in service._store.jobs if j.id == job_id)
+    assert job.enabled == original_enabled
+    assert job.state.next_run_at_ms == original_next_run
+    assert job.updated_at_ms == original_updated_at
+    assert store_path.read_bytes() == original_disk
+
+
+def test_update_job_rollback_on_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """update_job must rollback in-memory state if _save_store fails."""
+    service, store_path = _started_service(tmp_path)
+    job_id = service._store.jobs[0].id
+    original_name = service._store.jobs[0].name
+    original_message = service._store.jobs[0].payload.message
+    original_updated_at = service._store.jobs[0].updated_at_ms
+    original_disk = store_path.read_bytes()
+
+    monkeypatch.setattr(CronService, "_atomic_write", staticmethod(_failing_atomic_write))
+
+    with pytest.raises(IOError, match="disk full"):
+        service.update_job(job_id, name="new_name", message="new_message")
+
+    # Check in-memory state was rolled back
+    job = next(j for j in service._store.jobs if j.id == job_id)
+    assert job.name == original_name
+    assert job.payload.message == original_message
+    assert job.updated_at_ms == original_updated_at
+    assert store_path.read_bytes() == original_disk
+
+
+def test_register_system_job_rollback_on_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """register_system_job must rollback in-memory state if _save_store fails."""
+    from nanobot.cron.types import CronJob, CronJobState, CronPayload
+
+    service, store_path = _started_service(tmp_path)
+    original_disk = store_path.read_bytes()
+    original_jobs = [j.id for j in service._store.jobs]
+
+    monkeypatch.setattr(CronService, "_atomic_write", staticmethod(_failing_atomic_write))
+
+    system_job = CronJob(
+        id="sys-job",
+        name="System Job",
+        enabled=True,
+        schedule=CronSchedule(kind="every", every_ms=60000),
+        payload=CronPayload(kind="system_event", message="check"),
+        state=CronJobState(),
+        created_at_ms=0,
+        updated_at_ms=0,
+        delete_after_run=False,
+    )
+
+    with pytest.raises(IOError, match="disk full"):
+        service.register_system_job(system_job)
+
+    # Check in-memory state was rolled back
+    current_jobs = [j.id for j in service._store.jobs]
+    assert current_jobs == original_jobs
+    assert store_path.read_bytes() == original_disk
