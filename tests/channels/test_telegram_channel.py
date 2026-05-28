@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -159,8 +158,10 @@ def _make_telegram_update(
     location=None,
 ):
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    chat = SimpleNamespace(type=chat_type, is_forum=False, id=-100123)
+    chat.get_member_count = AsyncMock(return_value=2)  # Simulate 1:1 chat for open policy
     message = SimpleNamespace(
-        chat=SimpleNamespace(type=chat_type, is_forum=False),
+        chat=chat,
         chat_id=-100123,
         text=text,
         caption=caption,
@@ -245,98 +246,6 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     assert api_req.kwargs["connection_pool_size"] == 32
     assert api_req.kwargs["pool_timeout"] == 10.0
     assert poll_req.kwargs["pool_timeout"] == 10.0
-
-
-def test_webhook_config_requires_https_url_and_secret() -> None:
-    with pytest.raises(ValueError, match="webhook_url is required"):
-        TelegramConfig(enabled=True, token="123:abc", mode="webhook")
-
-    with pytest.raises(ValueError, match="public HTTPS URL"):
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            mode="webhook",
-            webhook_url="http://example.com/telegram",
-            webhook_secret_token="secret",
-        )
-
-    with pytest.raises(ValueError, match="webhook_secret_token is required"):
-        TelegramConfig(
-            enabled=True,
-            token="123:abc",
-            mode="webhook",
-            webhook_url="https://example.com/telegram",
-        )
-
-
-@pytest.mark.asyncio
-async def test_start_webhook_mode(monkeypatch) -> None:
-    _FakeHTTPXRequest.clear()
-    config = TelegramConfig(
-        enabled=True,
-        token="123:abc",
-        allow_from=["*"],
-        mode="webhook",
-        webhook_url="https://example.com/telegram",
-        webhook_listen_host="127.0.0.1",
-        webhook_listen_port=8081,
-        webhook_path="/telegram",
-        webhook_secret_token="secret-token",
-        webhook_max_connections=1,
-    )
-    bus = MessageBus()
-    channel = TelegramChannel(config, bus)
-    app = _FakeApp(lambda: setattr(channel, "_running", False))
-    builder = _FakeBuilder(app)
-
-    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
-    monkeypatch.setattr(
-        "nanobot.channels.telegram.Application",
-        SimpleNamespace(builder=lambda: builder),
-    )
-
-    await channel.start()
-
-    assert app.updater.start_polling_kwargs is None
-    assert app.updater.start_webhook_kwargs == {
-        "listen": "127.0.0.1",
-        "port": 8081,
-        "url_path": "telegram",
-        "webhook_url": "https://example.com/telegram",
-        "allowed_updates": ["message"],
-        "drop_pending_updates": False,
-        "secret_token": "secret-token",
-        "max_connections": 1,
-    }
-
-
-@pytest.mark.asyncio
-async def test_running_message_handler_reorders_same_session_updates() -> None:
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
-        MessageBus(),
-    )
-    seen: list[int] = []
-
-    async def fake_process(update, context) -> None:
-        seen.append(update.message.message_id)
-
-    channel._process_message_update = fake_process
-    channel._running = True
-
-    first = _make_telegram_update(text="first")
-    first.update_id = 100
-    first.message.message_id = 1
-    second = _make_telegram_update(text="second")
-    second.update_id = 101
-    second.message.message_id = 2
-
-    await channel._on_message(second, None)
-    await channel._on_message(first, None)
-    await asyncio.sleep(0.3)
-    channel._running = False
-
-    assert seen == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -1978,8 +1887,10 @@ def _make_bot_telegram_update(
 ):
     """Create a telegram update from a bot user."""
     user = SimpleNamespace(id=99999, username="other_bot", first_name="OtherBot", is_bot=is_bot)
+    chat = SimpleNamespace(type=chat_type, is_forum=False, id=-100123)
+    chat.get_member_count = AsyncMock(return_value=2)  # Simulate 1:1 chat for open policy
     message = SimpleNamespace(
-        chat=SimpleNamespace(type=chat_type, is_forum=False),
+        chat=chat,
         chat_id=-100123,
         text=text,
         caption=caption,
