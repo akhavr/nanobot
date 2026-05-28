@@ -1566,6 +1566,7 @@ class TelegramChannel(BaseChannel):
         """Detect and handle eval capture: reply to forwarded message in eval group.
 
         Returns True if this was an eval capture (message should not be processed normally).
+        Adds 👀 reaction when starting, and 👍 on successful capture.
         """
         from nanobot.config.loader import load_config
 
@@ -1583,6 +1584,9 @@ class TelegramChannel(BaseChannel):
         forward_origin = getattr(reply, "forward_origin", None)
         if not forward_origin:
             return False
+
+        # Add eyes reaction to indicate processing started
+        await self._add_reaction(str(message.chat_id), message.message_id, "👀")
 
         # Handle different forward_origin types (python-telegram-bot v22.7+)
         sender_user = getattr(forward_origin, "sender_user", None)
@@ -1605,12 +1609,17 @@ class TelegramChannel(BaseChannel):
         if not explanation.strip():
             return False
 
-        await self._handle_eval_capture(
+        success = await self._handle_eval_capture(
             original_chat_id=original_chat_id,
             forward_date=forward_date,
             bad_message_text=reply.text or reply.caption or "",
             explanation=explanation,
         )
+
+        # Add thumbs up reaction on successful capture
+        if success:
+            await self._add_reaction(str(message.chat_id), message.message_id, "👍")
+
         return True
 
     def _store_message_index(self, chat_id: str, text: str) -> None:
@@ -1630,13 +1639,15 @@ class TelegramChannel(BaseChannel):
         forward_date: datetime,
         bad_message_text: str,
         explanation: str,
-    ) -> None:
+    ) -> bool:
         """Extract context and store eval capture entry.
 
         Uses tiered session lookup:
         1. Direct lookup by original_chat_id
         2. Tier 1: Lookup by timestamp in message index
         3. Tier 2: Content search fallback across all sessions
+
+        Returns True if eval was successfully captured, False otherwise.
         """
         from nanobot.config.loader import load_config
         from nanobot.session.manager import SessionManager
@@ -1670,7 +1681,7 @@ class TelegramChannel(BaseChannel):
 
         if not session_data:
             self.logger.info("Eval capture: no session found for {} (all tiers failed), skipping", original_chat_id)
-            return
+            return False
 
         context: list[dict[str, str]] = []
         if session_data.get("messages"):
@@ -1719,6 +1730,7 @@ class TelegramChannel(BaseChannel):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         self.logger.info("Captured eval feedback for chat {}", original_chat_id)
+        return True
 
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot.
