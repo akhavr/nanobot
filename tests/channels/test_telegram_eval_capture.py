@@ -827,8 +827,8 @@ async def test_eval_capture_adds_thumbsup_on_success(telegram_channel, temp_work
 
 
 @pytest.mark.asyncio
-async def test_eval_capture_no_thumbsup_on_failure(telegram_channel, temp_workspace):
-    """When session not found, no 👍 reaction (only 👀)."""
+async def test_eval_capture_removes_eyes_on_failure(telegram_channel, temp_workspace):
+    """When session not found, 👀 reaction is removed (not left hanging)."""
     mock_config = MagicMock()
     mock_config.eval = _make_eval_config(group_id="-123")
     mock_config.workspace_path = temp_workspace
@@ -849,11 +849,54 @@ async def test_eval_capture_no_thumbsup_on_failure(telegram_channel, temp_worksp
     with patch("nanobot.config.loader.load_config", return_value=mock_config):
         await telegram_channel._try_eval_capture(message)
 
-    # Check reactions: should have 👀 but NOT 👍
+    # Check reactions: should have 👀 added first, then removed (None = empty reaction list)
     reactions = telegram_channel._app.bot.reactions
-    emojis = [r["emoji"] for r in reactions]
-    assert "👀" in emojis
-    assert "👍" not in emojis
+    assert len(reactions) == 2  # 👀 added, then removed
+    assert reactions[0]["emoji"] == "👀"  # First: eyes added
+    assert reactions[1]["emoji"] is None  # Second: reaction removed
+    assert "👍" not in [r["emoji"] for r in reactions]
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_keeps_eyes_until_result(telegram_channel, temp_workspace):
+    """👀 reaction stays visible until success/failure is determined."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-123")
+    mock_config.workspace_path = temp_workspace
+
+    telegram_channel._app = FakeApp()
+
+    # Create session file so capture succeeds
+    forward_date = datetime.now(timezone.utc)
+    sessions_dir = temp_workspace / "sessions"
+    session_file = sessions_dir / "telegram_-456.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:-456", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "assistant", "content": "bot response", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    forward_origin = _make_forward_origin_chat(-456, forward_date)
+    forwarded_msg = _make_forwarded_message_with_origin(forward_origin, text="bot response")
+
+    message = _make_mock_message(
+        chat_id=-123,
+        text="This is my feedback",
+        reply_to_message=forwarded_msg,
+    )
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        result = await telegram_channel._try_eval_capture(message)
+
+    assert result is True
+
+    # On success: 👀 added first, then 👍 (eyes NOT removed, just replaced by thumbsup)
+    reactions = telegram_channel._app.bot.reactions
+    assert len(reactions) == 2
+    assert reactions[0]["emoji"] == "👀"  # Eyes added immediately
+    assert reactions[1]["emoji"] == "👍"  # Thumbs up on success (replaces eyes)
 
 
 @pytest.mark.asyncio
@@ -909,3 +952,42 @@ async def test_eval_capture_reactions_e2e(telegram_channel, temp_workspace):
     # Verify feedback was stored
     feedback_path = temp_workspace / "evals" / "feedback.jsonl"
     assert feedback_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_failure_removes_reaction(telegram_channel, temp_workspace):
+    """E2E: Forward message with no matching session, verify 👀 is removed."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-100")
+    mock_config.workspace_path = temp_workspace
+
+    telegram_channel._app = FakeApp()
+
+    # No session file - simulate forwarding from unknown user
+    forward_date = datetime.now(timezone.utc)
+
+    # Create forwarded message from a user with no session
+    forward_origin = _make_forward_origin_user(user_id=99999999, forward_date=forward_date)
+    forwarded_msg = _make_forwarded_message_with_origin(forward_origin, text="Unknown bot response")
+
+    evaluator_reply = _make_mock_message(
+        chat_id=-100,
+        text="This response is wrong!",
+        reply_to_message=forwarded_msg,
+    )
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        result = await telegram_channel._try_eval_capture(evaluator_reply)
+
+    # Capture returns True (it handled the message) but failed to find session
+    assert result is True
+
+    # Verify reactions: 👀 added then removed (None), no 👍
+    reactions = telegram_channel._app.bot.reactions
+    assert len(reactions) == 2
+    assert reactions[0]["emoji"] == "👀"  # Eyes added on start
+    assert reactions[1]["emoji"] is None  # Eyes removed on failure (empty reaction list)
+
+    # Verify no feedback was stored (session not found)
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert not feedback_path.exists()

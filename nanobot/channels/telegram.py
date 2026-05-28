@@ -1566,7 +1566,7 @@ class TelegramChannel(BaseChannel):
         """Detect and handle eval capture: reply to forwarded message in eval group.
 
         Returns True if this was an eval capture (message should not be processed normally).
-        Adds 👀 reaction when starting, and 👍 on successful capture.
+        Adds 👀 reaction when starting, 👍 on success, removes reaction on failure.
         """
         from nanobot.config.loader import load_config
 
@@ -1616,9 +1616,11 @@ class TelegramChannel(BaseChannel):
             explanation=explanation,
         )
 
-        # Add thumbs up reaction on successful capture
+        # Add thumbs up reaction on successful capture, remove eyes on failure
         if success:
             await self._add_reaction(str(message.chat_id), message.message_id, "👍")
+        else:
+            await self._remove_reaction(str(message.chat_id), message.message_id)
 
         return True
 
