@@ -1464,21 +1464,26 @@ class TelegramChannel(BaseChannel):
         if not reply:
             return False
 
-        forward_date = getattr(reply, "forward_date", None)
-        if not forward_date:
-            return False  # Not a forward at all
+        forward_origin = getattr(reply, "forward_origin", None)
+        if not forward_origin:
+            return False
 
-        # Handle different forward types
-        forward_from_chat = getattr(reply, "forward_from_chat", None)
-        forward_from_user = getattr(reply, "forward_from", None)
+        # Handle different forward_origin types (python-telegram-bot v22.7+)
+        sender_user = getattr(forward_origin, "sender_user", None)
+        sender_chat = getattr(forward_origin, "sender_chat", None)
+        origin_chat = getattr(forward_origin, "chat", None)
 
-        if forward_from_chat:
-            original_chat_id = str(forward_from_chat.id)
-        elif forward_from_user:
-            original_chat_id = str(forward_from_user.id)  # DM session uses user_id
+        if sender_user:
+            original_chat_id = str(sender_user.id)
+        elif sender_chat:
+            original_chat_id = str(sender_chat.id)
+        elif origin_chat:
+            original_chat_id = str(origin_chat.id)
         else:
             self.logger.info("Eval capture: forward has no identifiable source, skipping")
             return False
+
+        forward_date = forward_origin.date
 
         explanation = message.text or message.caption or ""
         if not explanation.strip():
