@@ -1601,12 +1601,14 @@ class TelegramChannel(BaseChannel):
             original_chat_id = str(origin_chat.id)
         else:
             self.logger.info("Eval capture: forward has no identifiable source, skipping")
+            await self._remove_reaction(str(message.chat_id), message.message_id)
             return False
 
         forward_date = forward_origin.date
 
         explanation = message.text or message.caption or ""
         if not explanation.strip():
+            await self._remove_reaction(str(message.chat_id), message.message_id)
             return False
 
         success = await self._handle_eval_capture(
