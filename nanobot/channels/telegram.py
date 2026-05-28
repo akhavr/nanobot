@@ -340,6 +340,121 @@ def _parse_group_id(text: str) -> str | None:
     return None
 
 
+def _text_hash(text: str) -> str:
+    """Hash first 200 chars of text for content matching."""
+    import hashlib
+    return hashlib.sha256(text[:200].encode()).hexdigest()[:16]
+
+
+class MessageIndex:
+    """Index mapping sent messages to sessions for eval capture lookup."""
+
+    def __init__(self, workspace_path: Path, max_entries: int = 1000):
+        self.workspace_path = Path(workspace_path)
+        self.max_entries = max_entries
+        self._index_path = self.workspace_path / "evals" / "message_index.json"
+
+    def _ensure_dir(self) -> None:
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load_all(self) -> list[dict]:
+        if not self._index_path.exists():
+            return []
+        try:
+            with open(self._index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("messages", [])
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _save(self, entries: list[dict]) -> None:
+        self._ensure_dir()
+        tmp = self._index_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"messages": entries}, f, ensure_ascii=False)
+        tmp.replace(self._index_path)
+
+    def store(
+        self,
+        session_key: str,
+        chat_id: str,
+        text: str,
+        timestamp: datetime | None = None,
+    ) -> None:
+        entries = self.load_all()
+        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        entry = {
+            "ts": ts,
+            "chat_id": chat_id,
+            "session_key": session_key,
+            "text_hash": _text_hash(text),
+        }
+        entries.append(entry)
+        if len(entries) > self.max_entries:
+            entries = entries[-self.max_entries:]
+        self._save(entries)
+
+    def lookup_by_timestamp(
+        self,
+        target_time: datetime,
+        tolerance_seconds: float = 5.0,
+    ) -> dict | None:
+        entries = self.load_all()
+        target_ts = target_time.timestamp()
+        for entry in reversed(entries):
+            try:
+                entry_ts = datetime.fromisoformat(entry["ts"]).timestamp()
+            except (ValueError, KeyError):
+                continue
+            if abs(entry_ts - target_ts) <= tolerance_seconds:
+                return entry
+        return None
+
+    def lookup_by_text_hash(self, text: str) -> dict | None:
+        entries = self.load_all()
+        target_hash = _text_hash(text)
+        for entry in reversed(entries):
+            if entry.get("text_hash") == target_hash:
+                return entry
+        return None
+
+
+def content_search_sessions(workspace_path: Path, text: str) -> str | None:
+    """Search all session files for a message matching the given text.
+
+    Returns the session_key if found, None otherwise.
+    """
+    sessions_dir = Path(workspace_path) / "sessions"
+    if not sessions_dir.exists():
+        return None
+
+    target_hash = _text_hash(text)
+
+    for session_file in sessions_dir.glob("telegram_*.jsonl"):
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                session_key = None
+                for line in f:
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("_type") == "metadata":
+                        session_key = msg.get("key")
+                        continue
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                        if _text_hash(content) == target_hash:
+                            return session_key
+        except OSError:
+            continue
+    return None
+
+
 @dataclass
 class _StreamBuf:
     """Per-chat streaming accumulator for progressive message editing."""
@@ -950,6 +1065,7 @@ class TelegramChannel(BaseChannel):
                 except Exception:
                     # Fall back to _send_text which handles HTML→plain gracefully.
                     await self._send_text(int_chat_id, extra_html_chunk)
+            self._store_message_index(chat_id, raw_text)
             self._stream_bufs.pop(chat_id, None)
             return
 
@@ -1497,6 +1613,17 @@ class TelegramChannel(BaseChannel):
         )
         return True
 
+    def _store_message_index(self, chat_id: str, text: str) -> None:
+        """Store sent message in the message index for eval capture lookup."""
+        try:
+            from nanobot.config.loader import load_config
+            config = load_config()
+            session_key = f"telegram:{chat_id}"
+            index = MessageIndex(config.workspace_path)
+            index.store(session_key, chat_id, text)
+        except Exception as e:
+            self.logger.debug("Failed to store message index: {}", e)
+
     async def _handle_eval_capture(
         self,
         original_chat_id: str,
@@ -1504,7 +1631,13 @@ class TelegramChannel(BaseChannel):
         bad_message_text: str,
         explanation: str,
     ) -> None:
-        """Extract context and store eval capture entry."""
+        """Extract context and store eval capture entry.
+
+        Uses tiered session lookup:
+        1. Direct lookup by original_chat_id
+        2. Tier 1: Lookup by timestamp in message index
+        3. Tier 2: Content search fallback across all sessions
+        """
         from nanobot.config.loader import load_config
         from nanobot.session.manager import SessionManager
 
@@ -1515,7 +1648,28 @@ class TelegramChannel(BaseChannel):
         session_data = sm.read_session_file(session_key)
 
         if not session_data:
-            self.logger.info("Eval capture: no session found for {}, skipping", session_key)
+            self.logger.debug("Eval capture: direct session lookup failed for {}, trying index", session_key)
+            index = MessageIndex(config.workspace_path)
+            index_entry = index.lookup_by_timestamp(forward_date, tolerance_seconds=5)
+            if not index_entry:
+                index_entry = index.lookup_by_text_hash(bad_message_text)
+            if index_entry:
+                session_key = index_entry["session_key"]
+                original_chat_id = session_key.split(":", 1)[1] if ":" in session_key else original_chat_id
+                session_data = sm.read_session_file(session_key)
+                self.logger.debug("Eval capture: index lookup found session {}", session_key)
+
+        if not session_data:
+            self.logger.debug("Eval capture: index lookup failed, trying content search")
+            found_key = content_search_sessions(config.workspace_path, bad_message_text)
+            if found_key:
+                session_key = found_key
+                original_chat_id = session_key.split(":", 1)[1] if ":" in session_key else original_chat_id
+                session_data = sm.read_session_file(session_key)
+                self.logger.debug("Eval capture: content search found session {}", session_key)
+
+        if not session_data:
+            self.logger.info("Eval capture: no session found for {} (all tiers failed), skipping", original_chat_id)
             return
 
         context: list[dict[str, str]] = []

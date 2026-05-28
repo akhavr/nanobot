@@ -535,3 +535,196 @@ async def test_eval_capture_e2e(telegram_channel, temp_workspace):
     assert "context" in entry
     assert len(entry["context"]) >= 1
     assert any(c["content"] == "What is the capital of France?" for c in entry["context"])
+
+
+# ---------------------------------------------------------------------------
+# Tests for message-to-session index (Tier 1) and content search fallback (Tier 2)
+# ---------------------------------------------------------------------------
+
+
+def test_message_index_store_on_send(temp_workspace):
+    """When bot sends message, entry is added to message_index.json."""
+    from nanobot.channels.telegram import MessageIndex
+
+    index = MessageIndex(temp_workspace)
+    index.store("telegram:12345", "-100123", "Hello, how can I help?")
+
+    entries = index.load_all()
+    assert len(entries) == 1
+    assert entries[0]["session_key"] == "telegram:12345"
+    assert entries[0]["chat_id"] == "-100123"
+    assert "text_hash" in entries[0]
+    assert "ts" in entries[0]
+
+
+def test_message_index_lookup_by_timestamp(temp_workspace):
+    """Find session by forward_origin.date with ±5s tolerance."""
+    from datetime import timedelta
+    from nanobot.channels.telegram import MessageIndex
+
+    index = MessageIndex(temp_workspace)
+    send_time = datetime.now(timezone.utc)
+    index.store("telegram:12345", "-100123", "Test message", send_time)
+
+    lookup_time = send_time + timedelta(seconds=3)
+    result = index.lookup_by_timestamp(lookup_time, tolerance_seconds=5)
+    assert result is not None
+    assert result["session_key"] == "telegram:12345"
+
+    lookup_time_outside = send_time + timedelta(seconds=10)
+    result_outside = index.lookup_by_timestamp(lookup_time_outside, tolerance_seconds=5)
+    assert result_outside is None
+
+
+def test_message_index_fifo_eviction(temp_workspace):
+    """Index stays under 1000 entries via FIFO eviction."""
+    from nanobot.channels.telegram import MessageIndex
+
+    index = MessageIndex(temp_workspace, max_entries=10)
+    for i in range(15):
+        index.store(f"telegram:{i}", "-100123", f"Message {i}")
+
+    entries = index.load_all()
+    assert len(entries) == 10
+    session_keys = [e["session_key"] for e in entries]
+    assert "telegram:0" not in session_keys
+    assert "telegram:14" in session_keys
+
+
+def test_content_search_fallback(temp_workspace):
+    """When index miss, search sessions by text hash."""
+    from nanobot.channels.telegram import content_search_sessions
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    session_file = sessions_dir / "telegram_12345.jsonl"
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:12345", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "user", "content": "Hello", "timestamp": "2024-01-01T00:01:00Z"},
+        {"role": "assistant", "content": "This is the bad message to find", "timestamp": "2024-01-01T00:01:30Z"},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    result = content_search_sessions(temp_workspace, "This is the bad message to find")
+    assert result is not None
+    assert result == "telegram:12345"
+
+
+def test_content_search_finds_match(temp_workspace):
+    """Content search returns correct session when text matches."""
+    from nanobot.channels.telegram import content_search_sessions
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(3):
+        session_file = sessions_dir / f"telegram_{i}.jsonl"
+        content = f"Unique content {i}" if i != 1 else "This is the target message"
+        with open(session_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"_type": "metadata", "key": f"telegram:{i}"}) + "\n")
+            f.write(json.dumps({"role": "assistant", "content": content}) + "\n")
+
+    result = content_search_sessions(temp_workspace, "This is the target message")
+    assert result == "telegram:1"
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_uses_tiered_lookup(telegram_channel, temp_workspace):
+    """Capture tries index first, then content search when sender_user.id is bot ID."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-100")
+    mock_config.workspace_path = temp_workspace
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    session_file = sessions_dir / "telegram_12345.jsonl"
+    forward_date = datetime.now(timezone.utc)
+    session_messages = [
+        {"_type": "metadata", "key": "telegram:12345", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "user", "content": "What is 2+2?", "timestamp": forward_date.isoformat()},
+        {"role": "assistant", "content": "The answer is 5", "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    from nanobot.channels.telegram import MessageIndex
+    index = MessageIndex(temp_workspace)
+    index.store("telegram:12345", "-100999", "The answer is 5", forward_date)
+
+    forward_origin = _make_forward_origin_user(user_id=999999, forward_date=forward_date)
+    forwarded_msg = _make_forwarded_message_with_origin(forward_origin, text="The answer is 5")
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        message = _make_mock_message(
+            chat_id=-100,
+            text="Wrong! 2+2=4",
+            reply_to_message=forwarded_msg,
+        )
+        result = await telegram_channel._try_eval_capture(message)
+
+    assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+    assert entry["original_chat_id"] == "12345"
+
+
+@pytest.mark.asyncio
+async def test_eval_capture_full_flow_with_index(telegram_channel, temp_workspace):
+    """E2E: Bot sends → forward to eval group → reply → captured with correct session via index."""
+    mock_config = MagicMock()
+    mock_config.eval = _make_eval_config(group_id="-100")
+    mock_config.workspace_path = temp_workspace
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    user_chat_id = "334424084"
+    session_file = sessions_dir / f"telegram_{user_chat_id}.jsonl"
+    forward_date = datetime.now(timezone.utc)
+    bot_response = "I think the sky is green."
+
+    session_messages = [
+        {"_type": "metadata", "key": f"telegram:{user_chat_id}", "created_at": "2024-01-01T00:00:00Z"},
+        {"role": "user", "content": "What color is the sky?", "timestamp": forward_date.isoformat()},
+        {"role": "assistant", "content": bot_response, "timestamp": forward_date.isoformat()},
+    ]
+    with open(session_file, "w", encoding="utf-8") as f:
+        for msg in session_messages:
+            f.write(json.dumps(msg) + "\n")
+
+    from nanobot.channels.telegram import MessageIndex
+    index = MessageIndex(temp_workspace)
+    index.store(f"telegram:{user_chat_id}", user_chat_id, bot_response, forward_date)
+
+    bot_user_id = 6836135386
+    forward_origin = _make_forward_origin_user(user_id=bot_user_id, forward_date=forward_date)
+    forwarded_msg = _make_forwarded_message_with_origin(forward_origin, text=bot_response)
+
+    evaluator_reply = _make_mock_message(
+        chat_id=-100,
+        text="The sky is blue, not green!",
+        reply_to_message=forwarded_msg,
+    )
+
+    with patch("nanobot.config.loader.load_config", return_value=mock_config):
+        result = await telegram_channel._try_eval_capture(evaluator_reply)
+
+    assert result is True
+
+    feedback_path = temp_workspace / "evals" / "feedback.jsonl"
+    assert feedback_path.exists()
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        entry = json.loads(f.readline())
+
+    assert entry["original_chat_id"] == user_chat_id
+    assert entry["bad_message"] == bot_response
+    assert entry["explanation"] == "The sky is blue, not green!"
+    assert len(entry["context"]) >= 1
