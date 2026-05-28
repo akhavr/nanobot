@@ -560,6 +560,7 @@ def test_message_index_store_on_send(temp_workspace):
 def test_message_index_lookup_by_timestamp(temp_workspace):
     """Find session by forward_origin.date with ±5s tolerance."""
     from datetime import timedelta
+
     from nanobot.channels.telegram import MessageIndex
 
     index = MessageIndex(temp_workspace)
