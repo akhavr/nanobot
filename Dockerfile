@@ -17,6 +17,8 @@ WORKDIR /app
 # Install Python dependencies first (cached layer). Hatch reads the custom build
 # hook from hatch_build.py even for this metadata-only install.
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md hatch_build.py ./
+# Copy nanobot-evals dependency (must be placed in build context before running docker build)
+COPY nanobot-evals/ nanobot-evals/
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
     uv pip install --system --no-cache . && \
     rm -rf nanobot bridge
